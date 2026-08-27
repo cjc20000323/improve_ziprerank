@@ -27,6 +27,8 @@ import torch
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from utils.colqwen_adapter_compat import transformers_compatible_colqwen_adapter
+
 # MMDocIR path for DSE model (vision_wrapper)
 # Set MMDOCIR_PATH environment variable or clone MMDocIR repo to ../MMDocIR
 MMDOCIR_PATH = os.environ.get("MMDOCIR_PATH", str(Path(__file__).parent.parent.parent / "MMDocIR"))
@@ -165,7 +167,8 @@ def _encode_documents_chunk(args):
         
         # Encode candidate images
         candidate_embeds = retriever.embed_quotes(candidate_images)
-        candidate_embeds = np.array(candidate_embeds)
+        if "colqwen" not in model_name.lower():
+            candidate_embeds = np.array(candidate_embeds)
         
         # Store results
         results[(doc_idx, start_idx, end_idx)] = {
@@ -302,10 +305,14 @@ def run_first_stage_retrieval_multigpu(
         # Encode queries for this document
         query_texts = [q["query"] for q in doc_queries]
         query_embeds = retriever.embed_queries(query_texts)
-        query_embeds = np.array(query_embeds)
-        
-        # Compute scores (dot product)
-        scores = query_embeds @ candidate_embeds.T  # [num_queries, num_candidates]
+
+        if "colqwen" in model_name.lower():
+            # ColQwen uses token-level MaxSim over variable-length embeddings.
+            scores = np.asarray(retriever.score(query_embeds, candidate_embeds))
+        else:
+            # Keep the original DSE dense dot-product scoring unchanged.
+            query_embeds = np.array(query_embeds)
+            scores = query_embeds @ candidate_embeds.T  # [num_queries, num_candidates]
         
         # Get top-k for each query
         for i, q in enumerate(doc_queries):
@@ -350,6 +357,7 @@ def run_first_stage_retrieval_single_gpu(
     annotations: List[Dict],
     parquet_df: pd.DataFrame,
     retriever,
+    model_name: str,
     top_k: int = 20,
     mode: str = "page",
     layouts_df: pd.DataFrame = None,
@@ -402,15 +410,19 @@ def run_first_stage_retrieval_single_gpu(
         
         # Encode candidates
         candidate_embeds = retriever.embed_quotes(candidate_images)
-        candidate_embeds = np.array(candidate_embeds)
         
         # Encode queries
         query_texts = [q["query"] for q in doc_queries]
         query_embeds = retriever.embed_queries(query_texts)
-        query_embeds = np.array(query_embeds)
-        
-        # Compute scores
-        scores = query_embeds @ candidate_embeds.T
+
+        if "colqwen" in model_name.lower():
+            # ColQwen uses token-level MaxSim over variable-length embeddings.
+            scores = np.asarray(retriever.score(query_embeds, candidate_embeds))
+        else:
+            # Keep the original DSE dense dot-product scoring unchanged.
+            candidate_embeds = np.array(candidate_embeds)
+            query_embeds = np.array(query_embeds)
+            scores = query_embeds @ candidate_embeds.T
         
         # Get top-k for each query
         for i, q in enumerate(doc_queries):
@@ -625,6 +637,13 @@ def main():
         action="store_true",
         help="Only evaluate cached results, skip retrieval even if cache doesn't exist",
     )
+
+    parser.add_argument(
+        "--base_ckpt",
+        type=str,
+        default="checkpoint/colqwen2-base",
+        help="Path to the ColQwen base model checkpoint",
+    )
     
     args = parser.parse_args()
     
@@ -716,6 +735,7 @@ def main():
     
     # Determine model path
     model_path = args.model_name
+    base_ckpt = args.base_ckpt
     if not os.path.exists(model_path):
         model_path = f"checkpoint/{os.path.basename(args.model_name)}"
     
@@ -773,13 +793,27 @@ def main():
         else:
             # Single GPU mode
             from vision_wrapper import DSE
+            from vision_wrapper import ColQwen2Retriever
             
-            print(f"Initializing DSE retriever from {model_path}...")
-            retriever = DSE(
-                model_name=model_path,
-                bs=args.batch_size,
-                flash_attn=use_flash_attn,
-            )
+            is_colqwen = "colqwen" in model_path.lower()
+            print(f"Initializing {'ColQwen' if is_colqwen else 'DSE'} retriever from {model_path}...")
+            if is_colqwen:
+                with transformers_compatible_colqwen_adapter(model_path) as adapter_path:
+                    retriever = ColQwen2Retriever(
+                        model_name=adapter_path,
+                        base_ckpt=base_ckpt,
+                        bs=args.batch_size,
+                        flash_attn=use_flash_attn,
+                    )
+                # Keep the original path for diagnostics after the temporary
+                # compatibility checkpoint has been cleaned up.
+                retriever.model_name = model_path
+            else:
+                retriever = DSE(
+                    model_name=model_path,
+                    bs=args.batch_size,
+                    flash_attn=use_flash_attn,
+                )
             
             os.chdir(original_dir)
             
@@ -802,6 +836,7 @@ def main():
                     annotations=annotations,
                     parquet_df=pages_df,
                     retriever=retriever,
+                    model_name=model_path,
                     top_k=args.top_k,
                     mode="page",
                 )
@@ -820,6 +855,7 @@ def main():
                     annotations=annotations,
                     parquet_df=pages_df,
                     retriever=retriever,
+                    model_name=model_path,
                     top_k=args.top_k,
                     mode="layout",
                     layouts_df=layouts_df,
