@@ -111,27 +111,52 @@ def main():
     # Load training data
     train_dataset, train_dataloader = initialize_dataset_and_loader(args, tokenizer, processor)
 
-    # Compute training steps
+    # Compute a provisional number of training steps before Accelerate shards
+    # the dataloader. When max_train_steps is inferred from the epoch count,
+    # this provisional value is used only to size the scheduler; the real
+    # optimizer-step count is recomputed after accelerator.prepare().
+    max_train_steps_was_inferred = args.max_train_steps is None
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
+    if max_train_steps_was_inferred:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    else:
-        args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # AcceleratedScheduler advances once per process when batches are sharded
+    # (split_batches=False). For an explicit max_train_steps, which represents
+    # real global optimizer updates, size the underlying scheduler accordingly.
+    # For an epoch-derived limit, the provisional unsharded step count already
+    # has this scaling and is corrected for logging/stopping after prepare().
+    scheduler_training_steps = (
+        args.max_train_steps
+        if max_train_steps_was_inferred
+        else args.max_train_steps * accelerator.num_processes
+    )
 
     # Initialize learning rate scheduler
     lr_scheduler = get_scheduler(
         name=args.lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=args.num_warmup_steps * accelerator.num_processes,
-        num_training_steps=args.max_train_steps
-        if args.max_train_steps
-        else args.num_train_epochs * num_update_steps_per_epoch,
+        num_training_steps=scheduler_training_steps,
     )
 
     # Prepare with accelerator
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
+
+    # accelerator.prepare() shards the dataloader across processes, so only
+    # now does its length reflect the number of batches seen by each process.
+    # max_train_steps and completed_steps are expressed as real synchronized
+    # optimizer updates, not per-process scheduler ticks.
+    num_update_steps_per_epoch = math.ceil(
+        len(train_dataloader) / args.gradient_accumulation_steps
+    )
+    if max_train_steps_was_inferred:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    else:
+        args.num_train_epochs = math.ceil(
+            args.max_train_steps / num_update_steps_per_epoch
+        )
 
     # Log training info
     total_batch_size = (
@@ -146,6 +171,8 @@ def main():
     logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Batches per device per epoch = {len(train_dataloader)}")
+    logger.info(f"  Optimization steps per epoch = {num_update_steps_per_epoch}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     logger.info(f"  Learning rate = {args.learning_rate}")
     logger.info(f"  Warmup steps = {args.num_warmup_steps}")
