@@ -24,6 +24,8 @@ wandb>=0.15.0
 
 # Evaluation dependencies
 tqdm>=4.65.0
+# 仅在 evaluate.py 启用 --analyze_token_similarity 时用于生成分布图
+matplotlib>=3.7.0
 
 # API clients (for baselines)
 openai>=1.0.0

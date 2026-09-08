@@ -34,6 +34,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Reuse shared functions from utils
 from utils.data_utils import create_ranking_prompt_for_training, prepare_ranking_inputs
 from utils.train_utils import resize_image_if_needed
+# 诊断模块本身不会在普通评估中收集数据；只有显式传入
+# --analyze_token_similarity 后，下面的 collector 才会被创建和启用。
+from utils.similarity_analysis import (
+    TokenSimilarityAnalysisCollector,
+    ensure_matplotlib_available,
+)
 from models.qwen3vl_with_qi_early import Qwen3VLWithQIEarly
 
 import re
@@ -457,8 +463,95 @@ def parse_args():
         default=0.1,
         help="Temperature for T2I similarity softmax in QI-EI (default: 0.1).",
     )
+
+    # QI-Early token 相似度分析参数。输出包括整体分布、正确/错误逐样例图、
+    # JSON 摘要以及可供后续重新画图的原始 .pt 分数。
+    parser.add_argument(
+        "--analyze_token_similarity",
+        action="store_true",
+        help=(
+            "Collect QI-Early visual-token similarity scores and plot Recall@1 "
+            "correct/incorrect examples. Page mode and a single reranking window are required."
+        ),
+    )
+    parser.add_argument(
+        "--similarity_output_dir",
+        type=str,
+        default="outputs/token_similarity_analysis",
+        help="Directory for token-similarity figures, metadata, and selected raw scores.",
+    )
+    parser.add_argument(
+        "--similarity_num_examples",
+        type=int,
+        default=5,
+        help="Number of Recall@1-correct and Recall@1-incorrect examples to plot (default: 5 each).",
+    )
+    parser.add_argument(
+        "--similarity_seed",
+        type=int,
+        default=42,
+        help="Seed for uniform reservoir sampling of similarity-analysis examples.",
+    )
+    parser.add_argument(
+        "--similarity_num_bins",
+        type=int,
+        default=80,
+        help="Number of fixed bins over token-similarity display range [-0.25, 0.25].",
+    )
     
     return parser.parse_args()
+
+
+def _find_qi_early_pruner(model):
+    """兼容裸模型及常见 wrapper，找到实际保存诊断数据的 QI-Early pruner。"""
+    # 训练/推理框架可能把原模型包在 model.module 或 model.model 下。
+    owners = [model, getattr(model, "module", None), getattr(model, "model", None)]
+    for owner in owners:
+        if owner is not None and hasattr(owner, "qi_early_pruner"):
+            return owner.qi_early_pruner
+    raise RuntimeError("QI-Early pruner was not found on the evaluation model")
+
+
+def _consume_qi_similarity_stats(
+    model,
+    candidate_original_indices: List[int],
+) -> List[Dict]:
+    """把最近一次 forward 的逐图剪枝分数复制到 CPU，并释放显存引用。"""
+    pruner = _find_qi_early_pruner(model)
+    raw_stats = pruner.last_similarity_stats
+    # 先清空模型侧缓存，避免下一窗口误用旧数据，也避免 GPU tensor 长时间驻留。
+    pruner.last_similarity_stats = None
+
+    if raw_stats is None:
+        raise RuntimeError(
+            "QI-Early did not expose token similarities. Ensure similarity collection "
+            "is enabled before running the model forward pass."
+        )
+    if len(raw_stats) != len(candidate_original_indices):
+        raise RuntimeError(
+            "QI-Early similarity/image count mismatch: "
+            f"scores={len(raw_stats)}, images={len(candidate_original_indices)}"
+        )
+
+    copied_stats = []
+    # candidate_original_indices 把“当前窗口中的图像次序”映射回“一阶段 Top-K
+    # 原始位置”。即使滑窗内部改变顺序，分数仍能和正确候选一一对应。
+    for candidate_pos, image_stats in zip(candidate_original_indices, raw_stats):
+        copied_stats.append({
+            "candidate_pos": int(candidate_pos),
+            "scores": image_stats["scores"].detach().to(
+                device="cpu", dtype=torch.float32
+            ).contiguous(),
+            "kept_mask": image_stats["kept_mask"].detach().to(
+                device="cpu", dtype=torch.bool
+            ).contiguous(),
+            "threshold": float(
+                image_stats["threshold"].detach().float().cpu().item()
+            ),
+            "num_original_tokens": int(image_stats["num_original_tokens"]),
+            "num_kept_tokens": int(image_stats["num_kept_tokens"]),
+        })
+    return copied_stats
 
 
 def get_image_from_binary(binary_data: bytes, max_size: int = 1024) -> Image.Image:
@@ -485,6 +578,8 @@ def rerank_window_with_images(
     end_pos: int,
     use_logits: bool = True,
     log_file=None,
+    candidate_original_indices: Optional[List[int]] = None,
+    similarity_window_records: Optional[List[Dict]] = None,
 ) -> List[int]:
     """
     Rerank a single window of candidates using pre-loaded images.
@@ -499,6 +594,8 @@ def rerank_window_with_images(
         end_pos: End position in original candidate list (for logging)
         use_logits: If True, use logits from first token. If False, use full text generation.
         log_file: Optional log file handle
+        candidate_original_indices: Original Top-K positions for images in this window.
+        similarity_window_records: Optional destination for per-image QI-Early scores.
         
     Returns:
         List of indices [0, 1, 2, ...] representing the ranking WITHIN the window
@@ -633,7 +730,7 @@ def rerank_window_with_images(
                 log_file.write(f"  {ranking_str}\n")
                 log_file.write("="*80 + "\n\n")
                 log_file.flush()
-        
+
         else:
             # MODE 2: Use full text generation (slower, more interpretable)
             max_tokens = window_size * 5  # Roughly "[X] > " = 5 tokens per passage
@@ -691,6 +788,23 @@ def rerank_window_with_images(
                 log_file.write(f"  {ranking_str}\n")
                 log_file.write("="*80 + "\n\n")
                 log_file.flush()
+
+    # forward 已结束，此时 pruner.last_similarity_stats 与 candidate_images 的输入顺序
+    # 完全一致；立即消费并转到 CPU，不会改变已经完成的剪枝或最终排序。
+    if similarity_window_records is not None:
+        if candidate_original_indices is None:
+            candidate_original_indices = list(range(window_size))
+        if len(candidate_original_indices) != window_size:
+            raise ValueError(
+                "candidate_original_indices must match the number of images in the window"
+            )
+        similarity_window_records.append({
+            "start_pos": start_pos,
+            "end_pos": end_pos,
+            "candidate_stats": _consume_qi_similarity_stats(
+                model, candidate_original_indices
+            ),
+        })
     
     # Record stats to global accumulator if available
     if _eval_stats is not None:
@@ -716,6 +830,7 @@ def sliding_window_rerank_with_images(
     stride: int,
     use_logits: bool = True,
     log_file=None,
+    similarity_window_records: Optional[List[Dict]] = None,
 ) -> List[int]:
     """
     Apply sliding window reranking to a list of candidate images.
@@ -730,6 +845,7 @@ def sliding_window_rerank_with_images(
         stride: How much to shift window (e.g., 10)
         use_logits: Use logits for ranking
         log_file: Optional log file handle
+        similarity_window_records: Optional destination for per-window QI-Early scores.
         
     Returns:
         List of indices representing the final ranking
@@ -764,6 +880,8 @@ def sliding_window_rerank_with_images(
             end_pos,
             use_logits=use_logits,
             log_file=log_file,
+            candidate_original_indices=indices[start_pos:end_pos],
+            similarity_window_records=similarity_window_records,
         )
         
         # Apply the ranking to both indices and images lists
@@ -801,6 +919,7 @@ def evaluate_mmdocir(
     sample_size: int = 100,
     seed: int = 42,
     log_file=None,
+    similarity_collector: Optional[TokenSimilarityAnalysisCollector] = None,
 ) -> List[Dict]:
     """
     Evaluate reranking on MMDocIR.
@@ -818,6 +937,7 @@ def evaluate_mmdocir(
         sample_size: Number of queries to sample (0 for all).
         seed: Random seed for sampling.
         log_file: Optional log file handle
+        similarity_collector: Optional Recall@1 token-similarity collector.
         
     Returns:
         List of result dicts with reranking scores
@@ -855,6 +975,18 @@ def evaluate_mmdocir(
             row = parquet_df.iloc[global_idx]
             img = get_image_from_binary(row['image_binary'])
             candidate_images.append(img)
+
+        # 分析模式要求一个 query 只做一次 forward。若存在多个滑窗，同一候选可能被
+        # 多次计算且输入次序不断变化，会使“一个候选对应一套 token 分数”不再唯一。
+        if similarity_collector is not None and len(candidate_images) > window_size:
+            raise ValueError(
+                "Token-similarity example analysis requires a single reranking window "
+                f"per query, but {qid} has {len(candidate_images)} candidates and "
+                f"window_size={window_size}. Set window_size to at least the candidate count."
+            )
+
+        # 这是单个 query 的临时缓冲区；collector 消费后只留下 CPU 数据。
+        query_similarity_windows = [] if similarity_collector is not None else None
         
         # Apply sliding window reranking
         if len(candidate_images) <= window_size:
@@ -869,6 +1001,8 @@ def evaluate_mmdocir(
                 end_pos=len(candidate_images),
                 use_logits=use_logits,
                 log_file=log_file,
+                candidate_original_indices=list(range(len(candidate_images))),
+                similarity_window_records=query_similarity_windows,
             )
         else:
             # Sliding window reranking
@@ -882,6 +1016,7 @@ def evaluate_mmdocir(
                 stride=stride,
                 use_logits=use_logits,
                 log_file=log_file,
+                similarity_window_records=query_similarity_windows,
             )
         
         # Create scores based on ranking position (higher score = better rank)
@@ -892,6 +1027,8 @@ def evaluate_mmdocir(
         
         # Build result in MMDocIR format
         result = {
+            # qid 仅用于图标题、日志和错误定位，不参与官方 MMDocIR 指标计算。
+            "qid": qid,
             "doc_name": item["doc_name"],
             "domain": item["domain"],
             "q_idx": item["q_idx"],
@@ -908,6 +1045,19 @@ def evaluate_mmdocir(
         
         if mode == "layout":
             result["layout_indices"] = item.get("top_k_layout_indices", [])
+
+        if similarity_collector is not None:
+            if query_similarity_windows is None or len(query_similarity_windows) != 1:
+                raise RuntimeError(
+                    f"Expected one similarity window for {qid}, got "
+                    f"{0 if query_similarity_windows is None else len(query_similarity_windows)}"
+                )
+            # 必须等最终 ranked_indices 已确定后再归组，才能判断 Recall@1 是否命中，
+            # 并按最终名次选出 Top1、其他负例和最高排名 GT。
+            similarity_collector.add_query(
+                result,
+                query_similarity_windows[0]["candidate_stats"],
+            )
         
         results.append(result)
     
@@ -1075,6 +1225,29 @@ def main():
     
     # Determine use_logits: default False, unless --use_logits is passed
     use_logits = args.use_logits and not args.no_logits
+
+    similarity_collector = None
+    if args.analyze_token_similarity:
+        # 当前“正确/错误”分组按 page-level Top1 是否命中定义；layout 指标是区域
+        # 重叠关系，不能直接套用同一个二元标签，因此这里明确限制为 page 模式。
+        if args.mode != "page":
+            raise ValueError("Token-similarity Recall@1 example analysis supports page mode only")
+        if not args.use_qi_early:
+            raise ValueError(
+                "--analyze_token_similarity requires --use_qi_early"
+            )
+        if abs(args.qi_early_keep_ratio - 0.5) > 1e-9:
+            raise ValueError(
+                "This Recall@1 token-similarity analysis is configured for 50% "
+                "visual-token retention; set --qi_early_keep_ratio 0.5"
+            )
+        # 在加载大模型/数据之前就检查依赖，避免运行很久后才因无法画图而失败。
+        ensure_matplotlib_available()
+        similarity_collector = TokenSimilarityAnalysisCollector(
+            num_examples=args.similarity_num_examples,
+            seed=args.similarity_seed,
+            num_bins=args.similarity_num_bins,
+        )
     
     print(f"Mode: {args.mode}")
     print(f"First-stage file: {args.first_stage_file}")
@@ -1087,6 +1260,12 @@ def main():
         print(f"QI-EI Visual Token Pruning: Enabled (keep {args.qi_early_keep_ratio*100:.0f}%)")
     else:
         print(f"QI-EI Visual Token Pruning: Disabled")
+    if similarity_collector is not None:
+        print(
+            "Token-similarity analysis: Enabled "
+            f"({args.similarity_num_examples} examples per Recall@1 group)"
+        )
+        print(f"Similarity output directory: {args.similarity_output_dir}")
     
     print("="*80)
     print()
@@ -1121,6 +1300,10 @@ def main():
         model.set_qi_early_keep_ratio(args.qi_early_keep_ratio)
         if hasattr(model.qi_early_pruner, 'temperature'):
             model.qi_early_pruner.temperature = args.qi_early_temperature
+        # 普通评估保持关闭，避免保存逐 token 分数带来的额外显存和 CPU 拷贝开销。
+        model.qi_early_pruner.set_collect_similarity_stats(
+            similarity_collector is not None
+        )
     else:
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             args.model_path,
@@ -1176,6 +1359,7 @@ def main():
             sample_size=args.sample_size,
             seed=args.seed,
             log_file=log_file,
+            similarity_collector=similarity_collector,
         )
         
         # Convert results to official MMDocIR format
@@ -1188,6 +1372,18 @@ def main():
             mode=args.mode,
             model_name="ZipRerank",
         )
+
+        if similarity_collector is not None:
+            # 指标计算完成后统一落盘：整体图使用所有合格 query，逐样例图仅使用
+            # reservoir sampling 抽中的正确/错误各 5 个（或命令行指定数量）样例。
+            similarity_paths = similarity_collector.save(
+                output_dir=args.similarity_output_dir,
+                keep_ratio=args.qi_early_keep_ratio,
+            )
+            print(f"\n{similarity_collector.report()}")
+            print("Token-similarity analysis files:")
+            for name, path in similarity_paths.items():
+                print(f"  {name}: {path}")
         
         # Update query count in stats
         _eval_stats.total_queries = len(results)
@@ -1219,4 +1415,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
