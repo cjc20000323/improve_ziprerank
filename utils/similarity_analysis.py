@@ -58,14 +58,28 @@ class TokenSimilarityAnalysisCollector:
         self.num_examples = num_examples
         self.seed = seed
         self.num_bins = num_bins
-        # 所有候选共用固定的 [-0.25, 0.25] bin 边界，保证不同 query 的分布可直接平均。
-        self.bin_edges = np.linspace(-0.25, 0.25, num_bins + 1, dtype=np.float32)
+        # 所有候选共用固定的 [0.0, 0.25] bin 边界，保证不同 query 的分布可直接平均。
+        self.bin_edges = np.linspace(0.0, 0.25, num_bins + 1, dtype=np.float32)
 
         self.correct_examples: List[Dict[str, Any]] = []
         self.incorrect_examples: List[Dict[str, Any]] = []
         self.eligible_counts = {"correct": 0, "incorrect": 0}
         self.total_queries = 0
         self.skipped_counts: DefaultDict[str, int] = defaultdict(int)
+
+        # 全量 query 的配对统计只维护浮点累加和，不保存所有候选的逐 token 分数，
+        # 因此查询数量增加时也不会持续占用大量内存。
+        self.comparison_eligible_queries = 0
+        self.comparison_skipped_counts: DefaultDict[str, int] = defaultdict(int)
+        self._comparison_sums: Dict[str, Dict[str, float]] = {
+            role: {
+                "pruning_threshold_similarity": 0.0,
+                "entropy_shannon_bits": 0.0,
+                "entropy_normalized": 0.0,
+                "entropy_effective_bins": 0.0,
+            }
+            for role in ("highest_ranked_incorrect", "highest_ranked_correct")
+        }
 
         # 两组使用独立随机数发生器：正确组抽到哪些 query，不受错误组数量影响。
         self._rng = {
@@ -99,9 +113,11 @@ class TokenSimilarityAnalysisCollector:
 
         if not gt_page_ids:
             self.skipped_counts["no_ground_truth_page"] += 1
+            self.comparison_skipped_counts["no_ground_truth_page"] += 1
             return
         if not ranked_indices:
             self.skipped_counts["empty_ranking"] += 1
+            self.comparison_skipped_counts["empty_ranking"] += 1
             return
         if len(candidate_stats) != len(top_k_global_indices):
             raise ValueError(
@@ -148,12 +164,25 @@ class TokenSimilarityAnalysisCollector:
             )
 
         # 按最终重排次序分别取出 GT 和非 GT 候选；列表首项就是各类中排名最高者。
+
         gt_positions = [
             pos for pos in ranked_indices if local_page_ids[pos] in gt_page_ids
         ]
         negative_positions = [
             pos for pos in ranked_indices if local_page_ids[pos] not in gt_page_ids
         ]
+
+        # 全查询聚合只要求 Top-K 中同时存在至少一个 GT 和一个非 GT，因此应在
+        # “逐样例画图需要三个负例”等限制之前更新，避免漏掉本可用于成对比较的 query。
+        if not gt_positions:
+            self.comparison_skipped_counts["correct_candidate_missing_from_topk"] += 1
+        elif not negative_positions:
+            self.comparison_skipped_counts["incorrect_candidate_missing_from_topk"] += 1
+        else:
+            self._add_query_candidate_comparison(
+                highest_incorrect_stats=stats_by_position[negative_positions[0]],
+                highest_correct_stats=stats_by_position[gt_positions[0]],
+            )
 
         top1_pos = ranked_indices[0]
         # 多 GT query 的官方 recall@1 数值可能是 1 / GT数；这里的“正确/错误”分组
@@ -280,17 +309,181 @@ class TokenSimilarityAnalysisCollector:
             "num_kept_tokens": int(stats["num_kept_tokens"]),
         }
 
-    def _normalized_histogram(self, scores: torch.Tensor) -> np.ndarray:
-        """将一张图的所有 token 分数转换成积分为 1 的概率密度直方图。"""
+    def _histogram_counts_and_density(
+        self,
+        scores: torch.Tensor,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """使用与绘图相同的边界计算原始 token 数量和归一化密度。"""
         # 将分数限制到当前展示区间，确保每个 token 都被计入首尾之间的某个 bin。
-        values = np.clip(scores.numpy(), -0.25, 0.25)
+        values = np.clip(scores.numpy(), self.bin_edges[0], self.bin_edges[-1])
         counts, _ = np.histogram(values, bins=self.bin_edges)
         total = counts.sum()
         if total == 0:
-            raise ValueError("No token similarities fell inside display range [-0.25, 0.25]")
+            raise ValueError("No token similarities fell inside display range [0.0, 0.25]")
         widths = np.diff(self.bin_edges)
         # 除以 token 总数和 bin 宽度后，曲线面积为 1；不同 token 数的图才可比较。
-        return counts.astype(np.float64) / (total * widths)
+        density = counts.astype(np.float64) / (total * widths)
+        return counts, density
+
+    def _normalized_histogram(self, scores: torch.Tensor) -> np.ndarray:
+        """将一张图的所有 token 分数转换成积分为 1 的概率密度直方图。"""
+        _, density = self._histogram_counts_and_density(scores)
+        return density
+
+    def _histogram_entropy(self, counts: np.ndarray) -> Dict[str, float]:
+        """基于逐 bin 概率计算 Shannon 熵及其便于比较的派生指标。"""
+        total = int(counts.sum())
+        if total <= 0:
+            raise ValueError("Histogram entropy requires at least one token")
+
+        probabilities = counts[counts > 0].astype(np.float64) / total
+        shannon_bits = float(-np.sum(probabilities * np.log2(probabilities)))
+        max_entropy_bits = math.log2(self.num_bins)
+        # 浮点误差可能让理论边界轻微越过 0 或 1，因此在写入 JSON 前夹紧。
+        normalized = float(np.clip(shannon_bits / max_entropy_bits, 0.0, 1.0))
+
+        return {
+            "shannon_bits": shannon_bits,
+            "normalized": normalized,
+            # 2**H 表示与当前分布具有相同熵的均匀分布会占据多少个 bin。
+            "effective_bins": float(2.0 ** shannon_bits),
+        }
+
+    def _candidate_comparison_values(
+        self,
+        stats: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """提取一个候选的剪枝阈值和剪枝前全部 token 的分布熵。"""
+        scores = torch.as_tensor(stats["scores"]).detach().float().cpu().contiguous()
+        if scores.ndim != 1 or scores.numel() == 0:
+            raise ValueError("Candidate comparison requires non-empty 1-D scores")
+        if not torch.isfinite(scores).all():
+            raise ValueError("Non-finite token similarity score encountered")
+
+        threshold_value = stats["threshold"]
+        if isinstance(threshold_value, torch.Tensor):
+            threshold = float(threshold_value.detach().float().cpu().item())
+        else:
+            threshold = float(threshold_value)
+        if not math.isfinite(threshold):
+            raise ValueError("Non-finite pruning threshold encountered")
+
+        counts, _ = self._histogram_counts_and_density(scores)
+        return {
+            "threshold": threshold,
+            "entropy": self._histogram_entropy(counts),
+        }
+
+    def _add_query_candidate_comparison(
+        self,
+        highest_incorrect_stats: Mapping[str, Any],
+        highest_correct_stats: Mapping[str, Any],
+    ) -> None:
+        """让一个 query 的最高排名错误候选和最高排名 GT 各贡献一次。"""
+        values_by_role = {
+            "highest_ranked_incorrect": self._candidate_comparison_values(
+                highest_incorrect_stats
+            ),
+            "highest_ranked_correct": self._candidate_comparison_values(
+                highest_correct_stats
+            ),
+        }
+
+        for role, values in values_by_role.items():
+            sums = self._comparison_sums[role]
+            entropy = values["entropy"]
+            sums["pruning_threshold_similarity"] += values["threshold"]
+            sums["entropy_shannon_bits"] += entropy["shannon_bits"]
+            sums["entropy_normalized"] += entropy["normalized"]
+            sums["entropy_effective_bins"] += entropy["effective_bins"]
+        self.comparison_eligible_queries += 1
+
+    def _all_query_candidate_comparison_summary(
+        self,
+        keep_ratio: float,
+    ) -> Dict[str, Any]:
+        """汇总所有可成对 query 的两类候选均值。"""
+        count = self.comparison_eligible_queries
+
+        def role_summary(role: str) -> Dict[str, Any]:
+            sums = self._comparison_sums[role]
+            if count == 0:
+                mean_threshold = None
+                mean_entropy = {
+                    "shannon_bits": None,
+                    "normalized": None,
+                    "effective_bins": None,
+                }
+            else:
+                mean_threshold = sums["pruning_threshold_similarity"] / count
+                mean_entropy = {
+                    "shannon_bits": sums["entropy_shannon_bits"] / count,
+                    "normalized": sums["entropy_normalized"] / count,
+                    "effective_bins": sums["entropy_effective_bins"] / count,
+                }
+            return {
+                "num_queries": count,
+                "mean_pruning_threshold_similarity": mean_threshold,
+                "mean_all_token_similarity_entropy": mean_entropy,
+            }
+
+        return {
+            "keep_ratio": keep_ratio,
+            "total_queries_seen": self.total_queries,
+            "eligible_paired_queries": count,
+            "skipped_queries": dict(sorted(self.comparison_skipped_counts.items())),
+            "query_weighting": (
+                "Each eligible query contributes exactly one candidate to each role."
+            ),
+            "selection_rule": {
+                "highest_ranked_incorrect": (
+                    "The non-GT candidate with the best final reranking position."
+                ),
+                "highest_ranked_correct": (
+                    "The GT candidate with the best final reranking position; "
+                    "only this candidate is used when a query has multiple GT pages."
+                ),
+            },
+            "entropy_basis": {
+                "score_group": "all visual tokens before pruning",
+                "display_range": [
+                    float(self.bin_edges[0]),
+                    float(self.bin_edges[-1]),
+                ],
+                "num_bins": self.num_bins,
+                "out_of_range_rule": (
+                    "Values are clipped into the first or last bin before entropy "
+                    "is calculated."
+                ),
+            },
+            "metrics": {
+                "highest_ranked_incorrect": role_summary(
+                    "highest_ranked_incorrect"
+                ),
+                "highest_ranked_correct": role_summary(
+                    "highest_ranked_correct"
+                ),
+            },
+        }
+
+    @staticmethod
+    def _candidate_score_groups(
+        candidate: Mapping[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        """按实际剪枝掩码把一个候选拆成全部、剪掉和保留三组 token。"""
+        scores = candidate["scores"]
+        kept_mask = candidate["kept_mask"]
+        score_groups = {
+            "all": scores,
+            "pruned": scores[~kept_mask],
+            "kept": scores[kept_mask],
+        }
+        if score_groups["pruned"].numel() == 0 or score_groups["kept"].numel() == 0:
+            raise ValueError(
+                f"Candidate {candidate['candidate_letter']} must contain both "
+                "pruned and kept visual tokens"
+            )
+        return score_groups
 
     def _add_group_histograms(
         self,
@@ -333,7 +526,7 @@ class TokenSimilarityAnalysisCollector:
             bucket[replacement_index] = example
 
     def save(self, output_dir: str, keep_ratio: float) -> Dict[str, str]:
-        """保存原始抽样分数、可读元数据、整体图和两组逐样例图。"""
+        """保存原始抽样分数、统计 JSON、整体图和逐 query 样例图。"""
         ensure_matplotlib_available()
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -341,9 +534,19 @@ class TokenSimilarityAnalysisCollector:
         keep_percent = int(round(keep_ratio * 100))
         raw_path = output_path / f"selected_token_similarity_examples_keep{keep_percent}.pt"
         summary_path = output_path / f"selected_token_similarity_examples_keep{keep_percent}.json"
+        histogram_path = output_path / f"selected_token_similarity_histograms_keep{keep_percent}.json"
+        comparison_path = output_path / (
+            f"all_query_candidate_similarity_summary_keep{keep_percent}.json"
+        )
         overall_path = output_path / f"overall_token_similarity_keep{keep_percent}.png"
-        correct_path = output_path / f"recall1_correct_examples_keep{keep_percent}.png"
-        incorrect_path = output_path / f"recall1_incorrect_examples_keep{keep_percent}.png"
+        correct_dir = output_path / f"recall1_correct_examples_keep{keep_percent}"
+        incorrect_dir = output_path / f"recall1_incorrect_examples_keep{keep_percent}"
+
+        comparison_summary = self._all_query_candidate_comparison_summary(keep_ratio)
+        comparison_path.write_text(
+            json.dumps(comparison_summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         # .pt 保留抽中样例的逐 token tensor，便于以后换 bin 或重新画图；
         # .json 只保存统计摘要和候选身份，方便直接检查而不依赖 PyTorch。
@@ -374,6 +577,7 @@ class TokenSimilarityAnalysisCollector:
                     "candidates and the highest-ranked GT candidate"
                 ),
             },
+            "all_query_candidate_comparison": comparison_summary,
             "correct_examples": [
                 self._example_summary(item) for item in self.correct_examples
             ],
@@ -387,25 +591,46 @@ class TokenSimilarityAnalysisCollector:
         )
 
         self._plot_overall(overall_path, keep_ratio)
-        self._plot_examples(
+        correct_figure_paths = self._plot_examples(
             self.correct_examples,
-            correct_path,
+            correct_dir,
             keep_ratio,
             group="correct",
         )
-        self._plot_examples(
+        incorrect_figure_paths = self._plot_examples(
             self.incorrect_examples,
-            incorrect_path,
+            incorrect_dir,
             keep_ratio,
             group="incorrect",
+        )
+
+        # 这个文件与逐样例图片一一对应。每个候选都记录 all/pruned/kept 三条
+        # 直方图在每个固定区间中的原始 token 数量，以及图片实际绘制的 density。
+        histogram_export = self._histogram_export(keep_ratio)
+        histogram_export["all_query_candidate_comparison"] = comparison_summary
+        histogram_export["figure_files"] = {
+            "correct": [
+                path.relative_to(output_path).as_posix()
+                for path in correct_figure_paths
+            ],
+            "incorrect": [
+                path.relative_to(output_path).as_posix()
+                for path in incorrect_figure_paths
+            ],
+        }
+        histogram_path.write_text(
+            json.dumps(histogram_export, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
 
         return {
             "raw_examples": str(raw_path),
             "summary": str(summary_path),
+            "histogram_counts": str(histogram_path),
+            "all_query_candidate_summary": str(comparison_path),
             "overall_figure": str(overall_path),
-            "correct_figure": str(correct_path),
-            "incorrect_figure": str(incorrect_path),
+            "correct_figure_directory": str(correct_dir),
+            "incorrect_figure_directory": str(incorrect_dir),
         }
 
     @staticmethod
@@ -446,6 +671,103 @@ class TokenSimilarityAnalysisCollector:
                 self._candidate_summary(candidate)
                 for candidate in example["candidates"]
             ],
+        }
+
+    def _candidate_histogram_export(
+        self,
+        candidate: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """导出一个候选子图中三条直方图的逐 bin 数量和密度。"""
+        exported = self._candidate_summary(candidate)
+        distributions = {}
+        for group_name, group_scores in self._candidate_score_groups(candidate).items():
+            counts, density = self._histogram_counts_and_density(group_scores)
+            raw_values = group_scores.numpy()
+            distributions[group_name] = {
+                "num_tokens": int(group_scores.numel()),
+                # 绘图会把显示范围外的值夹到首尾 bin；单独记录数量便于识别这种情况。
+                "num_clipped_below_range": int(
+                    np.count_nonzero(raw_values < self.bin_edges[0])
+                ),
+                "num_clipped_above_range": int(
+                    np.count_nonzero(raw_values > self.bin_edges[-1])
+                ),
+                "counts": counts.astype(np.int64).tolist(),
+                "density": density.tolist(),
+                "entropy": self._histogram_entropy(counts),
+            }
+        exported["distributions"] = distributions
+        return exported
+
+    def _example_histogram_export(
+        self,
+        example: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """导出图片中一整行 query 的候选身份和直方图数据。"""
+        return {
+            "qid": example["qid"],
+            "doc_name": example["doc_name"],
+            "domain": example["domain"],
+            "q_idx": example["q_idx"],
+            "query": example["query"],
+            "ground_truth_page_ids": example["ground_truth_page_ids"],
+            "recall_at_1": example["recall_at_1"],
+            "recall1_correct": example["recall1_correct"],
+            "candidates": [
+                self._candidate_histogram_export(candidate)
+                for candidate in example["candidates"]
+            ],
+        }
+
+    def _histogram_export(self, keep_ratio: float) -> Dict[str, Any]:
+        """构造可独立解读并能精确复现逐样例直方图的 JSON 数据。"""
+        bin_definitions = []
+        for bin_index, (left_edge, right_edge) in enumerate(
+            zip(self.bin_edges[:-1], self.bin_edges[1:])
+        ):
+            bin_definitions.append({
+                "bin_index": bin_index,
+                "left_edge": float(left_edge),
+                "right_edge": float(right_edge),
+                "left_inclusive": True,
+                # np.histogram 只有最后一个区间包含右端点。
+                "right_inclusive": bin_index == self.num_bins - 1,
+            })
+
+        return {
+            "keep_ratio": keep_ratio,
+            "display_range": [float(self.bin_edges[0]), float(self.bin_edges[-1])],
+            "num_bins": self.num_bins,
+            "bins": bin_definitions,
+            "distribution_order": ["all", "pruned", "kept"],
+            "count_semantics": (
+                "Raw visual-token counts after values outside display_range are "
+                "clipped into the first or last bin."
+            ),
+            "density_semantics": (
+                "counts / (num_tokens * bin_width); these are the y-values "
+                "drawn by the example figures."
+            ),
+            "entropy_semantics": {
+                "shannon_bits": "-sum(p_i * log2(p_i)) over non-empty bins.",
+                "normalized": (
+                    "shannon_bits / log2(num_bins): 0 means all mass is in one "
+                    "bin; 1 means uniform mass across all bins."
+                ),
+                "effective_bins": (
+                    "2 ** shannon_bits: the equivalent number of equally occupied bins."
+                ),
+            },
+            "groups": {
+                "correct": [
+                    self._example_histogram_export(example)
+                    for example in self.correct_examples
+                ],
+                "incorrect": [
+                    self._example_histogram_export(example)
+                    for example in self.incorrect_examples
+                ],
+            },
         }
 
     def _plot_overall(self, output_path: Path, keep_ratio: float) -> None:
@@ -489,7 +811,7 @@ class TokenSimilarityAnalysisCollector:
 
             title_label = "Recall@1 correct" if group == "correct" else "Recall@1 incorrect (GT in Top-K)"
             ax.set_title(f"{title_label}\nEligible queries: {self.eligible_counts[group]}")
-            ax.set_xlim(-0.25, 0.25)
+            ax.set_xlim(0.0, 0.25)
             ax.set_xlabel("Max cosine similarity per visual token")
             ax.grid(alpha=0.2)
             if plotted:
@@ -510,25 +832,13 @@ class TokenSimilarityAnalysisCollector:
     def _plot_examples(
         self,
         examples: Sequence[Mapping[str, Any]],
-        output_path: Path,
+        output_dir: Path,
         keep_ratio: float,
         group: str,
-    ) -> None:
-        """每行展示一个 query，并把它的四个候选分别画在四个独立子图中。"""
+    ) -> List[Path]:
+        """每个 query 单独保存一张图，图内四个候选各占一个子图。"""
         plt = importlib.import_module("matplotlib.pyplot")
-
-        # 每个样例固定选择四个候选，因此使用“一行一个 query、四列四个候选”的布局。
-        # sharey="row" 让同一 query 的四张图共用纵轴尺度，便于直接比较密度高低。
-        num_rows = max(len(examples), 1)
-        num_columns = 4
-        fig, axes = plt.subplots(
-            num_rows,
-            num_columns,
-            figsize=(22, 4.2 * num_rows),
-            squeeze=False,
-            sharex=True,
-            sharey="row",
-        )
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         # 同一候选子图中的颜色固定表示 token 状态，而候选角色由标题说明。
         # 三组分数分别归一化为面积为 1 的密度，比较的是分布形状而非 token 数量。
@@ -552,22 +862,22 @@ class TokenSimilarityAnalysisCollector:
                 "linewidth": 1.7,
             },
         }
-        legend_handles = None
+        generated_paths = []
 
-        if not examples:
-            axes[0, 0].text(
-                0.5,
-                0.5,
-                "No eligible queries",
-                ha="center",
-                va="center",
-                transform=axes[0, 0].transAxes,
+        for example_index, example in enumerate(examples):
+            # 一张图片只对应一个 query；四列分别展示该 query 选出的四个候选。
+            # 共用纵轴尺度，便于在同一样例内部比较三个分布的形状和峰值。
+            fig, axes = plt.subplots(
+                1,
+                4,
+                figsize=(22, 5.4),
+                squeeze=False,
+                sharex=True,
+                sharey=True,
             )
-            axes[0, 0].set_axis_off()
-            for unused_ax in axes[0, 1:]:
-                unused_ax.set_visible(False)
+            candidate_axes = axes[0]
+            legend_handles = None
 
-        for row_index, example in enumerate(examples):
             # 标题在每个候选子图中都保留 query ID 和截断后的 query 文本，确保单独
             # 查看或裁剪某个子图时，仍能知道它属于哪个查询。
             short_query = textwrap.shorten(
@@ -577,23 +887,11 @@ class TokenSimilarityAnalysisCollector:
             )
 
             for column_index, candidate in enumerate(example["candidates"]):
-                ax = axes[row_index, column_index]
-                scores = candidate["scores"]
-                kept_mask = candidate["kept_mask"]
-                pruned_mask = ~kept_mask
+                ax = candidate_axes[column_index]
 
                 # all_scores 是剪枝前的全部 token；另外两组由实际 kept_mask 精确切分，
                 # 而不是仅根据阈值重新推断，因此阈值处存在并列分数时也不会分错。
-                score_groups = {
-                    "all": scores,
-                    "pruned": scores[pruned_mask],
-                    "kept": scores[kept_mask],
-                }
-                if score_groups["pruned"].numel() == 0 or score_groups["kept"].numel() == 0:
-                    raise ValueError(
-                        f"Candidate {candidate['candidate_letter']} of {example['qid']} "
-                        "must contain both pruned and kept visual tokens"
-                    )
+                score_groups = self._candidate_score_groups(candidate)
 
                 subplot_handles = []
                 for score_group, group_scores in score_groups.items():
@@ -624,40 +922,50 @@ class TokenSimilarityAnalysisCollector:
                     legend_handles = [*subplot_handles, threshold_handle]
 
                 ax.set_title(
-                    f"Example {row_index + 1} | {example['qid']}\n"
+                    f"Example {example_index + 1} | {example['qid']}\n"
                     f"{short_query}\n"
                     f"{candidate['role_label']}: [{candidate['candidate_letter']}] "
                     f"page={candidate['local_page_id']}, "
                     f"rank={candidate['final_rank']}, cut={candidate['threshold']:.3f}",
                     fontsize=8.5,
                 )
-                ax.set_xlim(-0.25, 0.25)
+                ax.set_xlim(0.0, 0.25)
                 ax.set_xlabel("Max cosine similarity per visual token")
                 if column_index == 0:
                     ax.set_ylabel("Density")
                 ax.grid(alpha=0.2)
 
-            # 正常情况下固定为四个候选；如果以后调整选择规则，隐藏该行多余子图。
-            for unused_ax in axes[row_index, len(example["candidates"]):]:
+            # 正常情况下固定为四个候选；如果以后调整选择规则，隐藏多余子图。
+            for unused_ax in candidate_axes[len(example["candidates"]):]:
                 unused_ax.set_visible(False)
 
-        group_title = "Recall@1 correct" if group == "correct" else "Recall@1 incorrect (GT present in Top-K)"
-        fig.suptitle(
-            f"{group_title}: selected token-similarity examples (keep {keep_ratio:.0%})\n"
-            "Each candidate subplot shows all, pruned, and kept visual-token distributions",
-            fontsize=13,
-        )
-        if legend_handles is not None:
-            fig.legend(
-                handles=legend_handles,
-                loc="upper center",
-                bbox_to_anchor=(0.5, 0.955),
-                ncol=4,
-                fontsize=9,
+            group_title = (
+                "Recall@1 correct"
+                if group == "correct"
+                else "Recall@1 incorrect (GT present in Top-K)"
             )
-        fig.tight_layout(rect=(0, 0, 1, 0.92))
-        fig.savefig(output_path, dpi=200, bbox_inches="tight")
-        plt.close(fig)
+            fig.suptitle(
+                f"{group_title}: example {example_index + 1}/{len(examples)} "
+                f"(keep {keep_ratio:.0%})\n"
+                "Each candidate subplot shows all, pruned, and kept visual-token distributions",
+                fontsize=13,
+            )
+            if legend_handles is not None:
+                fig.legend(
+                    handles=legend_handles,
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, 0.90),
+                    ncol=4,
+                    fontsize=9,
+                )
+            fig.tight_layout(rect=(0, 0, 1, 0.82))
+
+            output_path = output_dir / f"example_{example_index + 1:02d}.png"
+            fig.savefig(output_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            generated_paths.append(output_path)
+
+        return generated_paths
 
     def report(self) -> str:
         """生成便于写入评估日志的样例计数和跳过原因摘要。"""
