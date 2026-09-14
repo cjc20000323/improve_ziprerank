@@ -6,6 +6,11 @@
 # qi_early_keep_ratio=0.5：每张图保留 50% 的视觉 token，即剪枝 50%。
 # similarity_num_examples=5：正确组和错误组分别均匀抽取 5 个样例；seed 保证可复现。
 # 输出目录中会生成整体图、两张逐样例图、JSON 摘要和原始 .pt 分数。
+# 全查询均值默认使用 Top-K 内全部 GT 和最终重排最靠前的 3 个错误候选。
+# 两个环境变量都接受非负整数；0 表示使用该类别在 Top-K 内的全部候选。
+SIMILARITY_COMPARISON_NUM_GROUND_TRUTH_CANDIDATES="${SIMILARITY_COMPARISON_NUM_GROUND_TRUTH_CANDIDATES:-0}"
+SIMILARITY_COMPARISON_NUM_INCORRECT_CANDIDATES="${SIMILARITY_COMPARISON_NUM_INCORRECT_CANDIDATES:-3}"
+
 python scripts/evaluate.py \
     --model_path /root/autodl-fs/models/ziprerank_stage2/final \
     --first_stage_file /root/autodl-tmp/data/mmdocir/first_stage_page_top20_dse.pkl \
@@ -19,4 +24,6 @@ python scripts/evaluate.py \
     --analyze_token_similarity \
     --similarity_num_examples 5 \
     --similarity_seed 42 \
+    --similarity_comparison_num_ground_truth_candidates "${SIMILARITY_COMPARISON_NUM_GROUND_TRUTH_CANDIDATES}" \
+    --similarity_comparison_num_incorrect_candidates "${SIMILARITY_COMPARISON_NUM_INCORRECT_CANDIDATES}" \
     --similarity_output_dir /root/autodl-tmp/outputs/ziprerank_similarity_keep50

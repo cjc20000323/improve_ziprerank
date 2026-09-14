@@ -498,6 +498,28 @@ def parse_args():
         default=80,
         help="Number of fixed bins over token-similarity display range [0.0, 0.25].",
     )
+    parser.add_argument(
+        "--similarity_comparison_num_ground_truth_candidates",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Maximum number of final-ranked ground-truth candidates per query in "
+            "the all-query mean statistics; 0 uses every GT available in Top-K "
+            "(default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--similarity_comparison_num_incorrect_candidates",
+        type=int,
+        default=3,
+        metavar="N",
+        help=(
+            "Maximum number of final-ranked non-GT candidates per query in the "
+            "all-query mean statistics; 0 uses every non-GT available in Top-K "
+            "(default: 3)."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -1241,12 +1263,30 @@ def main():
                 "This Recall@1 token-similarity analysis is configured for 50% "
                 "visual-token retention; set --qi_early_keep_ratio 0.5"
             )
+        # 候选数为 0 时表示使用该类全部候选，负数没有明确含义，因此在加载模型前
+        # 直接拒绝。两个参数只改变 all_query_candidate_similarity_summary 的均值。
+        if args.similarity_comparison_num_ground_truth_candidates < 0:
+            raise ValueError(
+                "--similarity_comparison_num_ground_truth_candidates must be "
+                "non-negative"
+            )
+        if args.similarity_comparison_num_incorrect_candidates < 0:
+            raise ValueError(
+                "--similarity_comparison_num_incorrect_candidates must be "
+                "non-negative"
+            )
         # 在加载大模型/数据之前就检查依赖，避免运行很久后才因无法画图而失败。
         ensure_matplotlib_available()
         similarity_collector = TokenSimilarityAnalysisCollector(
             num_examples=args.similarity_num_examples,
             seed=args.similarity_seed,
             num_bins=args.similarity_num_bins,
+            comparison_num_ground_truth_candidates=(
+                args.similarity_comparison_num_ground_truth_candidates
+            ),
+            comparison_num_incorrect_candidates=(
+                args.similarity_comparison_num_incorrect_candidates
+            ),
         )
 
     print(f"Mode: {args.mode}")
@@ -1264,6 +1304,21 @@ def main():
         print(
             "Token-similarity analysis: Enabled "
             f"({args.similarity_num_examples} examples per Recall@1 group)"
+        )
+        gt_comparison_count = (
+            "all"
+            if args.similarity_comparison_num_ground_truth_candidates == 0
+            else str(args.similarity_comparison_num_ground_truth_candidates)
+        )
+        incorrect_comparison_count = (
+            "all"
+            if args.similarity_comparison_num_incorrect_candidates == 0
+            else str(args.similarity_comparison_num_incorrect_candidates)
+        )
+        print(
+            "All-query candidate means: "
+            f"ground_truth={gt_comparison_count}, "
+            f"top_ranked_incorrect={incorrect_comparison_count} per query"
         )
         print(f"Similarity output directory: {args.similarity_output_dir}")
 
@@ -1378,9 +1433,22 @@ def main():
         if similarity_collector is not None:
             # 指标计算完成后统一落盘：整体图使用所有合格 query，逐样例图仅使用
             # reservoir sampling 抽中的正确/错误各 5 个（或命令行指定数量）样例。
+            # global_idx 在诊断记录中就是 parquet 的行位置。读取器只在 save() 遍历
+            # 最终抽中的四候选样例时调用，并直接返回原始字节，不经过模型输入阶段的
+            # resize_image_if_needed，因此落盘图片保持 parquet 中的原始像素尺寸。
+            def load_similarity_image_binary(global_idx: int) -> bytes:
+                row_index = int(global_idx)
+                if not 0 <= row_index < len(parquet_df):
+                    raise IndexError(
+                        f"Candidate global_idx {row_index} is outside parquet "
+                        f"row range [0, {len(parquet_df)})"
+                    )
+                return bytes(parquet_df.iloc[row_index]["image_binary"])
+
             similarity_paths = similarity_collector.save(
                 output_dir=args.similarity_output_dir,
                 keep_ratio=args.qi_early_keep_ratio,
+                image_binary_loader=load_similarity_image_binary,
             )
             print(f"\n{similarity_collector.report()}")
             print("Token-similarity analysis files:")

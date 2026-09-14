@@ -3,7 +3,7 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -85,7 +85,12 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
         )
 
     def test_all_query_comparison_uses_best_ranked_gt_and_query_mean(self):
-        collector = TokenSimilarityAnalysisCollector(num_examples=5, seed=7)
+        collector = TokenSimilarityAnalysisCollector(
+            num_examples=5,
+            seed=7,
+            comparison_num_ground_truth_candidates=1,
+            comparison_num_incorrect_candidates=1,
+        )
         result = self._result(
             # GT candidate_pos=4 排在 candidate_pos=2 之前，因此应选择 pos=4。
             ranked_indices=[0, 4, 1, 2, 3],
@@ -102,8 +107,8 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
 
         summary = collector._all_query_candidate_comparison_summary(keep_ratio=0.5)
         self.assertEqual(summary["eligible_paired_queries"], 2)
-        incorrect = summary["metrics"]["highest_ranked_incorrect"]
-        correct = summary["metrics"]["highest_ranked_correct"]
+        incorrect = summary["metrics"]["top_ranked_incorrect_candidates"]
+        correct = summary["metrics"]["ground_truth_candidates"]
         # 两次分别为 0.10/0.12；query 等权均值为 0.11。
         self.assertAlmostEqual(
             incorrect["mean_pruning_threshold_similarity"],
@@ -115,8 +120,64 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             0.15,
         )
 
-    def test_save_writes_per_bin_counts_for_each_candidate_distribution(self):
+    def test_all_query_comparison_defaults_to_all_gt_and_top_three_incorrect(self):
         collector = TokenSimilarityAnalysisCollector(num_examples=5, seed=7)
+        result = self._result(
+            ranked_indices=[0, 4, 1, 2, 3],
+            ground_truth_page_ids=[3, 5],
+        )
+
+        first_stats = self._candidate_stats()
+        collector.add_query(result, first_stats)
+        second_stats = self._candidate_stats()
+        for item in second_stats:
+            item["threshold"] += 0.02
+        collector.add_query(result, second_stats)
+
+        # 每个 query 的 GT 为 pos=4/2，错误候选为最终排名最靠前的 pos=0/1/3。
+        # 两个 query 共贡献 4 个 GT 与 6 个错误候选，所有均值按候选等权计算。
+        summary = collector._all_query_candidate_comparison_summary(keep_ratio=0.5)
+        ground_truth = summary["metrics"]["ground_truth_candidates"]
+        incorrect = summary["metrics"]["top_ranked_incorrect_candidates"]
+        self.assertEqual(ground_truth["num_queries"], 2)
+        self.assertEqual(ground_truth["num_candidates"], 4)
+        self.assertEqual(incorrect["num_candidates"], 6)
+        self.assertAlmostEqual(
+            ground_truth["mean_pruning_threshold_similarity"],
+            0.14,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_pruning_threshold_similarity"],
+            0.12333333333333334,
+        )
+        self.assertAlmostEqual(
+            ground_truth["mean_all_token_similarity"],
+            0.03,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_all_token_similarity"],
+            0.013333333333333334,
+        )
+        self.assertEqual(
+            summary["selection_rule"]["ground_truth_candidates"][
+                "maximum_per_query"
+            ],
+            0,
+        )
+        self.assertEqual(
+            summary["selection_rule"]["top_ranked_incorrect_candidates"][
+                "maximum_per_query"
+            ],
+            3,
+        )
+
+    def test_save_writes_per_bin_counts_for_each_candidate_distribution(self):
+        collector = TokenSimilarityAnalysisCollector(
+            num_examples=5,
+            seed=7,
+            comparison_num_ground_truth_candidates=1,
+            comparison_num_incorrect_candidates=1,
+        )
         collector.add_query(
             self._result(
                 ranked_indices=[2, 0, 1, 3, 4],
@@ -200,8 +261,10 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
 
         self.assertEqual(comparison["total_queries_seen"], 1)
         self.assertEqual(comparison["eligible_paired_queries"], 1)
-        incorrect_metrics = comparison["metrics"]["highest_ranked_incorrect"]
-        correct_metrics = comparison["metrics"]["highest_ranked_correct"]
+        incorrect_metrics = comparison["metrics"][
+            "top_ranked_incorrect_candidates"
+        ]
+        correct_metrics = comparison["metrics"]["ground_truth_candidates"]
         self.assertAlmostEqual(
             incorrect_metrics["mean_pruning_threshold_similarity"],
             0.10,
@@ -217,6 +280,44 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
         self.assertAlmostEqual(
             correct_metrics["mean_all_token_similarity_entropy"]["shannon_bits"],
             1.5,
+        )
+
+    def test_overall_incorrect_curves_use_distinct_overlap_safe_styles(self):
+        collector = TokenSimilarityAnalysisCollector(num_examples=1, seed=7)
+        one_density_curve = torch.ones(collector.num_bins).numpy()
+        collector.eligible_counts["incorrect"] = 1
+        for role in ("top1_incorrect", "other_negatives", "ground_truth"):
+            collector._group_histograms["incorrect"][role].append(
+                one_density_curve
+            )
+
+        # 使用模拟坐标轴捕获 plot 参数，验证完全重合的数据仍会获得不同线型、
+        # marker 以及错开的 marker 起始位置，不依赖测试机器是否安装 matplotlib。
+        fake_pyplot = MagicMock()
+        correct_ax = MagicMock()
+        incorrect_ax = MagicMock()
+        fake_pyplot.subplots.return_value = (
+            MagicMock(),
+            [correct_ax, incorrect_ax],
+        )
+        with patch(
+            "utils.similarity_analysis.importlib.import_module",
+            return_value=fake_pyplot,
+        ):
+            collector._plot_overall(Path("unused.png"), keep_ratio=0.5)
+
+        plot_calls = incorrect_ax.plot.call_args_list
+        self.assertEqual(
+            [call.kwargs["linestyle"] for call in plot_calls],
+            ["-", ":", "-."],
+        )
+        self.assertEqual(
+            [call.kwargs["marker"] for call in plot_calls],
+            ["o", "s", "^"],
+        )
+        self.assertEqual(
+            [call.kwargs["markevery"] for call in plot_calls],
+            [(0, 10), (3, 10), (6, 10)],
         )
 
     def test_incorrect_query_without_gt_in_topk_is_skipped(self):

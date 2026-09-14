@@ -21,10 +21,15 @@ import random
 import textwrap
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, DefaultDict, Dict, List, Mapping, Sequence
+from typing import Any, DefaultDict, Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
+
+from .similarity_image_export import (
+    ImageBinaryLoader,
+    export_selected_similarity_candidate_images,
+)
 
 
 def ensure_matplotlib_available() -> None:
@@ -49,15 +54,34 @@ class TokenSimilarityAnalysisCollector:
         num_examples: int = 5,
         seed: int = 42,
         num_bins: int = 80,
+        comparison_num_ground_truth_candidates: int = 0,
+        comparison_num_incorrect_candidates: int = 3,
     ) -> None:
         if num_examples <= 0:
             raise ValueError(f"num_examples must be positive, got {num_examples}")
         if num_bins <= 1:
             raise ValueError(f"num_bins must be greater than 1, got {num_bins}")
+        if comparison_num_ground_truth_candidates < 0:
+            raise ValueError(
+                "comparison_num_ground_truth_candidates must be non-negative, "
+                f"got {comparison_num_ground_truth_candidates}"
+            )
+        if comparison_num_incorrect_candidates < 0:
+            raise ValueError(
+                "comparison_num_incorrect_candidates must be non-negative, "
+                f"got {comparison_num_incorrect_candidates}"
+            )
 
         self.num_examples = num_examples
         self.seed = seed
         self.num_bins = num_bins
+        # 这两个参数只控制“所有 query 的候选均值”统计，不影响 Recall@1 分组、
+        # reservoir sampling 或逐样例图片。0 表示不限制数量，即使用该 query 在
+        # 一阶段 Top-K 中实际存在的该类全部候选；正数表示按最终重排名次最多取 N 个。
+        self.comparison_num_ground_truth_candidates = (
+            comparison_num_ground_truth_candidates
+        )
+        self.comparison_num_incorrect_candidates = comparison_num_incorrect_candidates
         # 所有候选共用固定的 [0.0, 0.25] bin 边界，保证不同 query 的分布可直接平均。
         self.bin_edges = np.linspace(0.0, 0.25, num_bins + 1, dtype=np.float32)
 
@@ -74,11 +98,15 @@ class TokenSimilarityAnalysisCollector:
         self._comparison_sums: Dict[str, Dict[str, float]] = {
             role: {
                 "pruning_threshold_similarity": 0.0,
+                "all_token_similarity": 0.0,
                 "entropy_shannon_bits": 0.0,
                 "entropy_normalized": 0.0,
                 "entropy_effective_bins": 0.0,
             }
-            for role in ("highest_ranked_incorrect", "highest_ranked_correct")
+            for role in ("ground_truth_candidates", "top_ranked_incorrect_candidates")
+        }
+        self._comparison_candidate_counts = {
+            role: 0 for role in self._comparison_sums
         }
 
         # 两组使用独立随机数发生器：正确组抽到哪些 query，不受错误组数量影响。
@@ -179,9 +207,25 @@ class TokenSimilarityAnalysisCollector:
         elif not negative_positions:
             self.comparison_skipped_counts["incorrect_candidate_missing_from_topk"] += 1
         else:
-            self._add_query_candidate_comparison(
-                highest_incorrect_stats=stats_by_position[negative_positions[0]],
-                highest_correct_stats=stats_by_position[gt_positions[0]],
+            # gt_positions 与 negative_positions 已按最终重排顺序排列。默认配置下
+            # GT 使用 Top-K 内全部正确候选，错误候选使用最终排名最靠前的 3 个；
+            # 当命令行传入其他上限时，仅改变这里的全查询汇总候选集合。
+            selected_gt_positions = self._select_comparison_positions(
+                gt_positions,
+                self.comparison_num_ground_truth_candidates,
+            )
+            selected_negative_positions = self._select_comparison_positions(
+                negative_positions,
+                self.comparison_num_incorrect_candidates,
+            )
+            self._add_query_candidate_set_comparison(
+                incorrect_stats=[
+                    stats_by_position[position]
+                    for position in selected_negative_positions
+                ],
+                ground_truth_stats=[
+                    stats_by_position[position] for position in selected_gt_positions
+                ],
             )
 
         top1_pos = ranked_indices[0]
@@ -371,8 +415,20 @@ class TokenSimilarityAnalysisCollector:
         counts, _ = self._histogram_counts_and_density(scores)
         return {
             "threshold": threshold,
+            "mean_similarity": float(scores.mean().item()),
             "entropy": self._histogram_entropy(counts),
         }
+
+    @staticmethod
+    def _select_comparison_positions(
+        ranked_positions: Sequence[int],
+        maximum_candidates: int,
+    ) -> List[int]:
+        """从一种候选中按最终名次取统计所需的位置。"""
+        # 0 是“全部”的显式哨兵值；复制列表可以避免调用方意外共享并修改原列表。
+        if maximum_candidates == 0:
+            return list(ranked_positions)
+        return list(ranked_positions[:maximum_candidates])
 
     def _add_query_candidate_comparison(
         self,
@@ -380,22 +436,45 @@ class TokenSimilarityAnalysisCollector:
         highest_correct_stats: Mapping[str, Any],
     ) -> None:
         """让一个 query 的最高排名错误候选和最高排名 GT 各贡献一次。"""
+        self._add_query_candidate_set_comparison(
+            incorrect_stats=[highest_incorrect_stats],
+            ground_truth_stats=[highest_correct_stats],
+        )
+
+    def _add_query_candidate_set_comparison(
+        self,
+        incorrect_stats: Sequence[Mapping[str, Any]],
+        ground_truth_stats: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """累计一个 query 中被选中的 GT 与高排名错误候选。"""
+        if not incorrect_stats or not ground_truth_stats:
+            raise ValueError(
+                "Candidate-set comparison requires at least one ground-truth and "
+                "one incorrect candidate"
+            )
+
+        # 先完成两类候选的数值提取，再更新累计器。这样任一候选数据非法时，
+        # 当前 query 不会只写入一半，从而保证候选计数和浮点累加和始终同步。
         values_by_role = {
-            "highest_ranked_incorrect": self._candidate_comparison_values(
-                highest_incorrect_stats
-            ),
-            "highest_ranked_correct": self._candidate_comparison_values(
-                highest_correct_stats
-            ),
+            "ground_truth_candidates": [
+                self._candidate_comparison_values(stats)
+                for stats in ground_truth_stats
+            ],
+            "top_ranked_incorrect_candidates": [
+                self._candidate_comparison_values(stats) for stats in incorrect_stats
+            ],
         }
 
-        for role, values in values_by_role.items():
+        for role, candidate_values in values_by_role.items():
             sums = self._comparison_sums[role]
-            entropy = values["entropy"]
-            sums["pruning_threshold_similarity"] += values["threshold"]
-            sums["entropy_shannon_bits"] += entropy["shannon_bits"]
-            sums["entropy_normalized"] += entropy["normalized"]
-            sums["entropy_effective_bins"] += entropy["effective_bins"]
+            for values in candidate_values:
+                entropy = values["entropy"]
+                sums["pruning_threshold_similarity"] += values["threshold"]
+                sums["all_token_similarity"] += values["mean_similarity"]
+                sums["entropy_shannon_bits"] += entropy["shannon_bits"]
+                sums["entropy_normalized"] += entropy["normalized"]
+                sums["entropy_effective_bins"] += entropy["effective_bins"]
+            self._comparison_candidate_counts[role] += len(candidate_values)
         self.comparison_eligible_queries += 1
 
     def _all_query_candidate_comparison_summary(
@@ -403,46 +482,65 @@ class TokenSimilarityAnalysisCollector:
         keep_ratio: float,
     ) -> Dict[str, Any]:
         """汇总所有可成对 query 的两类候选均值。"""
-        count = self.comparison_eligible_queries
+        query_count = self.comparison_eligible_queries
 
         def role_summary(role: str) -> Dict[str, Any]:
             sums = self._comparison_sums[role]
-            if count == 0:
+            candidate_count = self._comparison_candidate_counts[role]
+            if candidate_count == 0:
                 mean_threshold = None
+                mean_similarity = None
                 mean_entropy = {
                     "shannon_bits": None,
                     "normalized": None,
                     "effective_bins": None,
                 }
             else:
-                mean_threshold = sums["pruning_threshold_similarity"] / count
+                mean_threshold = (
+                    sums["pruning_threshold_similarity"] / candidate_count
+                )
+                mean_similarity = sums["all_token_similarity"] / candidate_count
                 mean_entropy = {
-                    "shannon_bits": sums["entropy_shannon_bits"] / count,
-                    "normalized": sums["entropy_normalized"] / count,
-                    "effective_bins": sums["entropy_effective_bins"] / count,
+                    "shannon_bits": sums["entropy_shannon_bits"] / candidate_count,
+                    "normalized": sums["entropy_normalized"] / candidate_count,
+                    "effective_bins": (
+                        sums["entropy_effective_bins"] / candidate_count
+                    ),
                 }
             return {
-                "num_queries": count,
+                "num_queries": query_count,
+                "num_candidates": candidate_count,
                 "mean_pruning_threshold_similarity": mean_threshold,
+                "mean_all_token_similarity": mean_similarity,
                 "mean_all_token_similarity_entropy": mean_entropy,
             }
 
         return {
             "keep_ratio": keep_ratio,
             "total_queries_seen": self.total_queries,
-            "eligible_paired_queries": count,
+            "eligible_paired_queries": query_count,
             "skipped_queries": dict(sorted(self.comparison_skipped_counts.items())),
-            "query_weighting": (
-                "Each eligible query contributes exactly one candidate to each role."
+            "candidate_weighting": (
+                "Each selected candidate contributes equally. A candidate's mean "
+                "similarity is calculated across all of its visual tokens before "
+                "candidate-level averaging."
             ),
             "selection_rule": {
-                "highest_ranked_incorrect": (
-                    "The non-GT candidate with the best final reranking position."
-                ),
-                "highest_ranked_correct": (
-                    "The GT candidate with the best final reranking position; "
-                    "only this candidate is used when a query has multiple GT pages."
-                ),
+                "ground_truth_candidates": {
+                    "maximum_per_query": self.comparison_num_ground_truth_candidates,
+                    "zero_means_all_available": True,
+                    "description": (
+                        "GT candidates available in the first-stage Top-K, ordered "
+                        "by final reranking position."
+                    ),
+                },
+                "top_ranked_incorrect_candidates": {
+                    "maximum_per_query": self.comparison_num_incorrect_candidates,
+                    "zero_means_all_available": True,
+                    "description": (
+                        "Non-GT candidates with the best final reranking positions."
+                    ),
+                },
             },
             "entropy_basis": {
                 "score_group": "all visual tokens before pruning",
@@ -455,13 +553,17 @@ class TokenSimilarityAnalysisCollector:
                     "Values are clipped into the first or last bin before entropy "
                     "is calculated."
                 ),
+                "aggregation": (
+                    "Entropy is calculated separately for every selected candidate, "
+                    "then averaged with equal candidate weight."
+                ),
             },
             "metrics": {
-                "highest_ranked_incorrect": role_summary(
-                    "highest_ranked_incorrect"
+                "ground_truth_candidates": role_summary(
+                    "ground_truth_candidates"
                 ),
-                "highest_ranked_correct": role_summary(
-                    "highest_ranked_correct"
+                "top_ranked_incorrect_candidates": role_summary(
+                    "top_ranked_incorrect_candidates"
                 ),
             },
         }
@@ -525,7 +627,12 @@ class TokenSimilarityAnalysisCollector:
         if replacement_index < self.num_examples:
             bucket[replacement_index] = example
 
-    def save(self, output_dir: str, keep_ratio: float) -> Dict[str, str]:
+    def save(
+        self,
+        output_dir: str,
+        keep_ratio: float,
+        image_binary_loader: Optional[ImageBinaryLoader] = None,
+    ) -> Dict[str, str]:
         """保存原始抽样分数、统计 JSON、整体图和逐 query 样例图。"""
         ensure_matplotlib_available()
         output_path = Path(output_dir)
@@ -623,7 +730,7 @@ class TokenSimilarityAnalysisCollector:
             encoding="utf-8",
         )
 
-        return {
+        output_paths = {
             "raw_examples": str(raw_path),
             "summary": str(summary_path),
             "histogram_counts": str(histogram_path),
@@ -632,6 +739,24 @@ class TokenSimilarityAnalysisCollector:
             "correct_figure_directory": str(correct_dir),
             "incorrect_figure_directory": str(incorrect_dir),
         }
+
+        # 图片读取器是可选依赖：普通单元测试或只重画历史 tensor 时保持原有行为；
+        # evaluate.py 显式传入读取器后，才恢复最终抽中样例的候选页面。这里复用与
+        # 分布图完全相同的两个 reservoir，保证图片和图中四个候选逐一对应。
+        if image_binary_loader is not None:
+            output_paths.update(
+                export_selected_similarity_candidate_images(
+                    example_groups={
+                        "correct": self.correct_examples,
+                        "incorrect": self.incorrect_examples,
+                    },
+                    output_dir=str(output_path),
+                    keep_ratio=keep_ratio,
+                    image_binary_loader=image_binary_loader,
+                )
+            )
+
+        return output_paths
 
     @staticmethod
     def _candidate_summary(candidate: Mapping[str, Any]) -> Dict[str, Any]:
@@ -776,27 +901,57 @@ class TokenSimilarityAnalysisCollector:
 
         centers = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2
         fig, axes = plt.subplots(1, 2, figsize=(15, 5.5), sharex=True)
+
+        # 颜色之外再使用线型和错位 marker 区分角色。某些候选的总体分布几乎完全
+        # 重合，仅依赖颜色时，后绘制的绿色曲线会覆盖红色曲线；dash 间隙和不同位置
+        # 的 marker 可以同时暴露两组数据，又不需要人为平移曲线而改变横轴含义。
         specifications = {
             "correct": [
-                ("top1_correct", "Top1 correct (GT)", "#2ca02c"),
-                ("other_negatives", "Other 3 negatives (query mean)", "#6c757d"),
+                ("top1_correct", "Top1 correct (GT)", "#2ca02c", "-", "o", 0),
+                (
+                    "other_negatives",
+                    "Other 3 negatives (query mean)",
+                    "#6c757d",
+                    "--",
+                    "s",
+                    4,
+                ),
             ],
             "incorrect": [
-                ("top1_incorrect", "Top1 incorrect", "#d62728"),
-                ("other_negatives", "Other 2 negatives (query mean)", "#6c757d"),
-                ("ground_truth", "Highest-ranked GT", "#2ca02c"),
+                ("top1_incorrect", "Top1 incorrect", "#d62728", "-", "o", 0),
+                (
+                    "other_negatives",
+                    "Other 2 negatives (query mean)",
+                    "#6c757d",
+                    ":",
+                    "s",
+                    3,
+                ),
+                ("ground_truth", "Highest-ranked GT", "#2ca02c", "-.", "^", 6),
             ],
         }
 
         for ax, group in zip(axes, ("correct", "incorrect")):
             plotted = False
-            for role, label, color in specifications[group]:
+            for role, label, color, line_style, marker, marker_offset in specifications[group]:
                 histograms = self._group_histograms[group].get(role, [])
                 if not histograms:
                     continue
                 values = np.stack(histograms, axis=0)
                 mean = values.mean(axis=0)
-                ax.plot(centers, mean, color=color, linewidth=2, label=label)
+                ax.plot(
+                    centers,
+                    mean,
+                    color=color,
+                    linestyle=line_style,
+                    linewidth=2,
+                    marker=marker,
+                    markevery=(marker_offset, 10),
+                    markersize=4.5,
+                    markerfacecolor="white",
+                    markeredgewidth=1.2,
+                    label=label,
+                )
                 if len(values) > 1:
                     # 阴影是在各 query 直方图之间估计的均值 95% 置信区间。
                     ci = 1.96 * values.std(axis=0, ddof=1) / math.sqrt(len(values))
