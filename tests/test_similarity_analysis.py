@@ -158,6 +158,17 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             incorrect["mean_all_token_similarity"],
             0.013333333333333334,
         )
+        # 所有候选只发生整体平移，token 离均差不变，因此两类候选的平均
+        # 总体方差都应保持为 0.025。
+        self.assertAlmostEqual(
+            ground_truth["mean_all_token_similarity_variance"],
+            0.025,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_all_token_similarity_variance"],
+            0.025,
+        )
+        self.assertEqual(summary["variance_basis"]["ddof"], 0)
         self.assertEqual(
             summary["selection_rule"]["ground_truth_candidates"][
                 "maximum_per_query"
@@ -230,6 +241,7 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
         candidate = exported["groups"]["correct"][0]["candidates"][0]
         distributions = candidate["distributions"]
         self.assertEqual(set(distributions), {"all", "pruned", "kept"})
+        self.assertAlmostEqual(candidate["similarity"]["variance"], 0.025)
 
         all_counts = distributions["all"]["counts"]
         pruned_counts = distributions["pruned"]["counts"]
@@ -252,6 +264,9 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             1.5 / math.log2(80),
         )
         self.assertAlmostEqual(all_entropy["effective_bins"], 2.0 ** 1.5)
+        self.assertAlmostEqual(distributions["all"]["variance"], 0.025)
+        self.assertAlmostEqual(distributions["pruned"]["variance"], 0.0025)
+        self.assertAlmostEqual(distributions["kept"]["variance"], 0.0025)
 
         # 两个被剪掉的负相似度都会夹到第一个 bin，因此熵为 0。
         pruned_entropy = distributions["pruned"]["entropy"]
@@ -280,6 +295,14 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
         self.assertAlmostEqual(
             correct_metrics["mean_all_token_similarity_entropy"]["shannon_bits"],
             1.5,
+        )
+        self.assertAlmostEqual(
+            incorrect_metrics["mean_all_token_similarity_variance"],
+            0.025,
+        )
+        self.assertAlmostEqual(
+            correct_metrics["mean_all_token_similarity_variance"],
+            0.025,
         )
 
     def test_overall_incorrect_curves_use_distinct_overlap_safe_styles(self):

@@ -99,6 +99,7 @@ class TokenSimilarityAnalysisCollector:
             role: {
                 "pruning_threshold_similarity": 0.0,
                 "all_token_similarity": 0.0,
+                "all_token_similarity_variance": 0.0,
                 "entropy_shannon_bits": 0.0,
                 "entropy_normalized": 0.0,
                 "entropy_effective_bins": 0.0,
@@ -416,6 +417,9 @@ class TokenSimilarityAnalysisCollector:
         return {
             "threshold": threshold,
             "mean_similarity": float(scores.mean().item()),
+            # 每张候选图的视觉 token 是本次诊断关心的完整总体，因此使用
+            # unbiased=False（ddof=0），单 token 候选也能得到定义良好的 0 方差。
+            "similarity_variance": float(scores.var(unbiased=False).item()),
             "entropy": self._histogram_entropy(counts),
         }
 
@@ -471,6 +475,9 @@ class TokenSimilarityAnalysisCollector:
                 entropy = values["entropy"]
                 sums["pruning_threshold_similarity"] += values["threshold"]
                 sums["all_token_similarity"] += values["mean_similarity"]
+                sums["all_token_similarity_variance"] += values[
+                    "similarity_variance"
+                ]
                 sums["entropy_shannon_bits"] += entropy["shannon_bits"]
                 sums["entropy_normalized"] += entropy["normalized"]
                 sums["entropy_effective_bins"] += entropy["effective_bins"]
@@ -490,6 +497,7 @@ class TokenSimilarityAnalysisCollector:
             if candidate_count == 0:
                 mean_threshold = None
                 mean_similarity = None
+                mean_variance = None
                 mean_entropy = {
                     "shannon_bits": None,
                     "normalized": None,
@@ -500,6 +508,9 @@ class TokenSimilarityAnalysisCollector:
                     sums["pruning_threshold_similarity"] / candidate_count
                 )
                 mean_similarity = sums["all_token_similarity"] / candidate_count
+                mean_variance = (
+                    sums["all_token_similarity_variance"] / candidate_count
+                )
                 mean_entropy = {
                     "shannon_bits": sums["entropy_shannon_bits"] / candidate_count,
                     "normalized": sums["entropy_normalized"] / candidate_count,
@@ -512,6 +523,7 @@ class TokenSimilarityAnalysisCollector:
                 "num_candidates": candidate_count,
                 "mean_pruning_threshold_similarity": mean_threshold,
                 "mean_all_token_similarity": mean_similarity,
+                "mean_all_token_similarity_variance": mean_variance,
                 "mean_all_token_similarity_entropy": mean_entropy,
             }
 
@@ -525,6 +537,18 @@ class TokenSimilarityAnalysisCollector:
                 "similarity is calculated across all of its visual tokens before "
                 "candidate-level averaging."
             ),
+            "variance_basis": {
+                "score_group": "all visual tokens before pruning",
+                "ddof": 0,
+                "definition": (
+                    "Population variance is calculated separately within every "
+                    "selected candidate."
+                ),
+                "aggregation": (
+                    "Candidate variances are averaged with equal candidate weight "
+                    "using the same selected candidates as the entropy metrics."
+                ),
+            },
             "selection_rule": {
                 "ground_truth_candidates": {
                     "maximum_per_query": self.comparison_num_ground_truth_candidates,
@@ -776,6 +800,8 @@ class TokenSimilarityAnalysisCollector:
             "similarity": {
                 "min": float(np.min(scores)),
                 "mean": float(np.mean(scores)),
+                # 与全查询汇总保持同一总体方差定义，便于直接核对抽中候选。
+                "variance": float(np.var(scores, ddof=0)),
                 "median": float(np.median(scores)),
                 "p90": float(np.quantile(scores, 0.9)),
                 "max": float(np.max(scores)),
@@ -819,6 +845,9 @@ class TokenSimilarityAnalysisCollector:
                 ),
                 "counts": counts.astype(np.int64).tolist(),
                 "density": density.tolist(),
+                # all、pruned、kept 都按各自包含的 token 计算总体方差；
+                # 其中 all 与 candidate.similarity.variance 是同一个统计量。
+                "variance": float(np.var(raw_values, ddof=0)),
                 "entropy": self._histogram_entropy(counts),
             }
         exported["distributions"] = distributions
