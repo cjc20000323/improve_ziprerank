@@ -1,15 +1,18 @@
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import torch
+from PIL import Image
 
 from models.qwen3vl_with_qi_early_token_alignment import (
     QIEarlyTokenAlignmentPruner,
 )
 from utils.token_alignment_analysis import (
     TokenAlignmentCollector,
+    find_dataset_query_input_positions,
     select_eligible_query_subset,
 )
 
@@ -26,6 +29,24 @@ class _FakeTokenizer:
         return f"decoded_{token_ids[0]}"
 
 
+class _CharacterOffsetTokenizer:
+    def __call__(self, text, **_kwargs):
+        return {
+            "input_ids": [ord(character) for character in text],
+            "offset_mapping": [
+                (index, index + 1) for index in range(len(text))
+            ],
+        }
+
+
+def _image_bytes(width=90, height=30):
+    buffer = io.BytesIO()
+    Image.new("RGB", (width, height), color=(120, 120, 120)).save(
+        buffer, format="PNG"
+    )
+    return buffer.getvalue()
+
+
 class TokenAlignmentCollectorTest(unittest.TestCase):
     @staticmethod
     def _candidate_stats():
@@ -38,14 +59,18 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
             records.append({
                 "candidate_pos": candidate_pos,
                 "scores": torch.tensor([0.1, 0.2, 0.3]) + candidate_pos * 0.01,
+                "query_max_similarities": (
+                    torch.tensor([0.7, 0.8, 0.9]) + candidate_pos * 0.01
+                ),
                 "kept_mask": torch.tensor([False, True, True]),
                 "max_text_token_indices": torch.tensor([1, 2, 1]),
                 "threshold": 0.2 + candidate_pos * 0.01,
                 "num_original_tokens": 3,
                 "num_kept_tokens": 2,
+                "image_grid_thw": [1, 1, 3],
                 "query_token_ids": shared_ids,
                 "query_input_positions": shared_positions,
-                "text_extraction_mode": "all_before_image",
+                "text_extraction_mode": "dataset_query_only",
             })
         return records
 
@@ -67,7 +92,11 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         }
 
     def test_exports_best_gt_best_wrong_argmax_and_keep_mask(self):
-        collector = TokenAlignmentCollector(_FakeTokenizer())
+        collector = TokenAlignmentCollector(
+            tokenizer=_FakeTokenizer(),
+            image_binary_loader=lambda _global_idx: _image_bytes(),
+            spatial_merge_size=1,
+        )
         collector.add_query(self._result(), self._candidate_stats())
 
         # 先验证最终排序选择出的正负候选，再验证单个视觉 token 的文本回查；
@@ -94,6 +123,9 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         self.assertEqual(first_visual["matched_token_id"], 11)
         self.assertEqual(first_visual["matched_vocab_token"], "vocab_11")
         self.assertEqual(first_visual["matched_decoded_text"], "decoded_11")
+        self.assertAlmostEqual(first_visual["max_similarity"], 0.72, places=6)
+        self.assertAlmostEqual(first_visual["pruning_similarity"], 0.12, places=6)
+        self.assertEqual(first_visual["patch_grid_position_trc"], [0, 0, 0])
 
         # Query token index 1 attracts visual tokens 0 and 2, one kept and one pruned.
         most_common = correct["matched_query_token_summary"][0]
@@ -103,7 +135,11 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         self.assertEqual(most_common["matched_pruned_visual_token_count"], 1)
 
     def test_save_writes_readable_json(self):
-        collector = TokenAlignmentCollector(_FakeTokenizer())
+        collector = TokenAlignmentCollector(
+            tokenizer=_FakeTokenizer(),
+            image_binary_loader=lambda _global_idx: _image_bytes(),
+            spatial_merge_size=1,
+        )
         collector.add_query(self._result(), self._candidate_stats())
 
         # 使用真实临时目录完成一次写入和读回，覆盖 Path 创建、UTF-8 JSON
@@ -114,8 +150,75 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
                 run_metadata={"test": True},
             )
             payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 4)
             self.assertEqual(payload["num_queries_exported"], 1)
             self.assertEqual(payload["queries"][0]["qid"], "doc_0")
+
+            # Both selected candidates receive an untouched source image and an
+            # overlay. A pixel in retained grid cell 1 must change while image size
+            # remains identical to the source parquet bytes.
+            for candidate in payload["queries"][0]["candidates"]:
+                original_path = output.parent / candidate["image_files"]["original"]
+                overlay_path = (
+                    output.parent
+                    / candidate["image_files"]["kept_patch_overlay"]
+                )
+                token_map_path = (
+                    output.parent
+                    / candidate["image_files"]["kept_patch_token_map"]
+                )
+                token_details_path = (
+                    output.parent
+                    / candidate["image_files"]["kept_patch_token_details"]
+                )
+                self.assertTrue(original_path.is_file())
+                self.assertTrue(overlay_path.is_file())
+                self.assertTrue(token_map_path.is_file())
+                self.assertTrue(token_details_path.is_file())
+                with Image.open(original_path) as original_image:
+                    with Image.open(overlay_path) as overlay_image:
+                        self.assertEqual(overlay_image.size, original_image.size)
+                        self.assertNotEqual(
+                            overlay_image.getpixel((45, 15)),
+                            original_image.getpixel((45, 15)),
+                        )
+                    with Image.open(token_map_path) as token_map_image:
+                        self.assertGreater(token_map_image.width, original_image.width)
+                        self.assertNotEqual(
+                            token_map_image.getpixel((45, 5)),
+                            token_map_image.getpixel((75, 5)),
+                        )
+                    with Image.open(token_details_path) as token_details_image:
+                        self.assertGreater(
+                            token_details_image.width,
+                            original_image.width,
+                        )
+
+    def test_finds_only_dataset_query_tokens_inside_prepared_input(self):
+        query = "invoice total in 2024?"
+        prompt = (
+            "You are RankGPT.\n\n"
+            "I will provide passages as images.\n\n"
+            f"Search Query: {query}\n\n"
+            "Rank the passages above based on their relevance to the search query.\n"
+            "Only output the ranking results."
+        )
+        tokenizer = _CharacterOffsetTokenizer()
+        prompt_ids = tokenizer(prompt)["input_ids"]
+        full_input_ids = [200_000, 200_001] + prompt_ids + [200_002]
+
+        # Character-level tokenization makes the expected boundary observable:
+        # every returned ID must reconstruct the raw dataset field exactly, with
+        # neither the field label nor the following fixed instruction included.
+        positions = find_dataset_query_input_positions(
+            prompt=prompt,
+            input_ids=full_input_ids,
+            tokenizer=tokenizer,
+        )
+        selected_text = "".join(chr(full_input_ids[index]) for index in positions)
+        self.assertEqual(selected_text, query)
+        self.assertNotIn("Search Query", selected_text)
+        self.assertNotIn("Rank the passages", selected_text)
 
     def test_query_prefilter_requires_both_gt_and_non_gt(self):
         # c 的 GT 不在 Top-K 内，不能组成诊断所需的正负候选对；固定 seed 下
@@ -180,6 +283,11 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         # 归一化余弦值，用来确认诊断分支只增加索引记录、没有改变基础分数。
         text_embeds = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
         image_embeds = [torch.tensor([[0.9, 0.1], [0.1, 0.9]])]
+        pruner.set_dataset_query_alignment_metadata(
+            token_ids=torch.tensor([10]),
+            input_positions=torch.tensor([4]),
+            query_embeds=text_embeds[:1],
+        )
 
         pruner(text_embeds=text_embeds, image_embeds_list=image_embeds)
 
@@ -193,6 +301,16 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         self.assertEqual(max_text_indices.tolist(), [0, 1])
         expected_scores = torch.tensor([0.9938837, 0.9938837])
         self.assertTrue(torch.allclose(scores, expected_scores, atol=1e-6))
+
+        dataset_indices = torch.as_tensor(
+            stats["dataset_query_max_text_token_indices"]
+        )
+        dataset_scores = torch.as_tensor(stats["dataset_query_max_similarities"])
+        self.assertEqual(dataset_indices.tolist(), [0, 0])
+        expected_dataset_scores = torch.tensor([0.9938837, 0.1104315])
+        self.assertTrue(
+            torch.allclose(dataset_scores, expected_dataset_scores, atol=1e-6)
+        )
 
 
 if __name__ == "__main__":

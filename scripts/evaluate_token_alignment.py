@@ -30,6 +30,7 @@ from models.qwen3vl_with_qi_early_token_alignment import (  # noqa: E402
 from scripts import evaluate as base_evaluate  # noqa: E402
 from utils.token_alignment_analysis import (  # noqa: E402
     TokenAlignmentCollector,
+    find_dataset_query_input_positions,
     select_eligible_query_subset,
 )
 
@@ -84,12 +85,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--qi_early_temperature", type=float, default=0.1)
     parser.add_argument(
+        "--overlay_alpha",
+        type=int,
+        default=72,
+        help="Opacity of the green retained-patch overlay in [0, 255].",
+    )
+    parser.add_argument(
         "--qi_early_text_mode",
         choices=["query_only", "all_before_image"],
         default=None,
         help=(
             "Optional override. If omitted, use the mode stored in the model "
-            "configuration. The JSON always records the effective mode."
+            "configuration. This controls pruning only; diagnostic token "
+            "matching always uses the dataset query text alone."
         ),
     )
     parser.add_argument(
@@ -103,6 +111,7 @@ def parse_args() -> argparse.Namespace:
 def _consume_qi_token_alignment_stats(
     model,
     candidate_original_indices: Sequence[int],
+    image_grid_thw: Any,
 ) -> Sequence[Dict[str, Any]]:
     """Copy diagnostic GPU tensors to CPU immediately after one forward.
 
@@ -117,9 +126,11 @@ def _consume_qi_token_alignment_stats(
     # 这四份缓存来自同一次 forward：raw_stats 按候选图像顺序排列，后三项则是
     # 所有候选共享的查询文本坐标系。复制前先整体取出，避免清缓存时丢失引用。
     raw_stats = pruner.last_similarity_stats
-    query_token_ids = getattr(pruner, "last_query_token_ids", None)
-    query_input_positions = getattr(pruner, "last_query_input_positions", None)
-    text_extraction_mode = getattr(pruner, "last_text_extraction_mode", None)
+    query_token_ids = getattr(pruner, "last_dataset_query_token_ids", None)
+    query_input_positions = getattr(
+        pruner, "last_dataset_query_input_positions", None
+    )
+    text_extraction_mode = getattr(pruner, "last_alignment_text_scope", None)
 
     # Drop model-owned GPU references early. Local references remain valid long
     # enough for the explicit CPU copy below and are released when this returns.
@@ -127,6 +138,11 @@ def _consume_qi_token_alignment_stats(
     pruner.last_query_token_ids = None
     pruner.last_query_input_positions = None
     pruner.last_text_extraction_mode = None
+    clear_dataset_query_metadata = getattr(
+        pruner, "clear_dataset_query_alignment_metadata", None
+    )
+    if clear_dataset_query_metadata is not None:
+        clear_dataset_query_metadata()
 
     if raw_stats is None:
         raise RuntimeError("QI-Early did not expose token-alignment statistics")
@@ -138,6 +154,19 @@ def _consume_qi_token_alignment_stats(
         raise RuntimeError(
             "QI-Early alignment/image count mismatch: "
             f"stats={len(raw_stats)}, images={len(candidate_original_indices)}"
+        )
+
+    # Processor grids are captured from the exact prepared window before inference.
+    # Their image order is the same order used by the pruner and candidate indices.
+    image_grids = torch.as_tensor(image_grid_thw).detach().to(
+        device="cpu", dtype=torch.long
+    ).contiguous()
+    if image_grids.ndim != 2 or image_grids.shape[1] != 3:
+        raise ValueError("image_grid_thw must have shape (num_candidates, 3)")
+    if image_grids.shape[0] != len(candidate_original_indices):
+        raise ValueError(
+            "Image-grid/candidate count mismatch: "
+            f"grids={image_grids.shape[0]}, candidates={len(candidate_original_indices)}"
         )
 
     if not isinstance(query_token_ids, torch.Tensor):
@@ -159,10 +188,17 @@ def _consume_qi_token_alignment_stats(
     # candidate_original_indices 保存当前窗口图像在一阶段候选列表中的位置。
     # zip 后，每份视觉统计就获得稳定的 candidate_pos，可在最终排序完成后回接
     # 到正确的页面；逐视觉 token 的三个向量仍保持完全相同的原始 patch 顺序。
-    for candidate_pos, image_stats in zip(candidate_original_indices, raw_stats):
-        if "max_text_token_indices" not in image_stats:
+    # 这里的三个诊断向量是 query-only 分数、保留掩码和 query-only argmax；另存的
+    # scores 是模型实际用于剪枝的分数，便于解释保留结果而不混淆两套文本范围。
+    for image_index, (candidate_pos, image_stats) in enumerate(
+        zip(candidate_original_indices, raw_stats)
+    ):
+        if (
+            "dataset_query_max_similarities" not in image_stats
+            or "dataset_query_max_text_token_indices" not in image_stats
+        ):
             raise RuntimeError(
-                "Missing per-visual-token text argmax. Ensure the diagnostic "
+                "Missing per-visual-token dataset-query alignment. Ensure the diagnostic "
                 "Qwen3VLWithQIEarlyTokenAlignment class is loaded."
             )
         copied_stats.append({
@@ -173,14 +209,18 @@ def _consume_qi_token_alignment_stats(
             "kept_mask": image_stats["kept_mask"].detach().to(
                 device="cpu", dtype=torch.bool
             ).contiguous(),
+            "query_max_similarities": image_stats[
+                "dataset_query_max_similarities"
+            ].detach().to(device="cpu", dtype=torch.float32).contiguous(),
             "max_text_token_indices": image_stats[
-                "max_text_token_indices"
+                "dataset_query_max_text_token_indices"
             ].detach().to(device="cpu", dtype=torch.long).contiguous(),
             "threshold": float(
                 image_stats["threshold"].detach().float().cpu().item()
             ),
             "num_original_tokens": int(image_stats["num_original_tokens"]),
             "num_kept_tokens": int(image_stats["num_kept_tokens"]),
+            "image_grid_thw": image_grids[image_index].tolist(),
             # These tensors are shared by all candidates in the current query;
             # they are not cloned twenty times in CPU memory.
             "query_token_ids": shared_query_token_ids,
@@ -212,6 +252,8 @@ def main() -> None:
         raise ValueError("--num_queries must be positive")
     if not 0.0 < args.qi_early_keep_ratio <= 1.0:
         raise ValueError("--qi_early_keep_ratio must be in (0, 1]")
+    if not 0 <= args.overlay_alpha <= 255:
+        raise ValueError("--overlay_alpha must be in [0, 255]")
 
     print("Loading MMDocIR page parquet...")
     parquet_df = pd.read_parquet(args.pages_parquet)
@@ -270,7 +312,16 @@ def main() -> None:
 
     # TokenAlignmentCollector 实现了 evaluate_mmdocir 所需的 add_query 接口。
     # 初始化基础评估模块的两个全局统计对象后，可以直接复用完整的推理与排序链路。
-    collector = TokenAlignmentCollector(processor.tokenizer)
+    def load_image_binary(global_idx: int) -> bytes:
+        return bytes(parquet_df.iloc[int(global_idx)]["image_binary"])
+
+    spatial_merge_size = int(model.config.vision_config.spatial_merge_size)
+    collector = TokenAlignmentCollector(
+        tokenizer=processor.tokenizer,
+        image_binary_loader=load_image_binary,
+        spatial_merge_size=spatial_merge_size,
+        overlay_alpha=args.overlay_alpha,
+    )
     base_evaluate._inference_timer = base_evaluate.InferenceTimer(model)
     base_evaluate._eval_stats = base_evaluate.EvalStats(
         use_logits=args.use_logits
@@ -279,12 +330,61 @@ def main() -> None:
     log_file = _open_log(args.llm_log_file, args)
     # noinspection PyProtectedMember
     original_consumer = base_evaluate._consume_qi_similarity_stats
+    original_input_preparer = base_evaluate.prepare_ranking_inputs
+    pending_image_grid_thw: Optional[torch.Tensor] = None
+
+    def prepare_inputs_with_dataset_query_alignment(
+        prompt,
+        passage_images,
+        active_processor,
+    ):
+        nonlocal pending_image_grid_thw
+        ranking_inputs = original_input_preparer(
+            prompt,
+            passage_images,
+            active_processor,
+        )
+
+        # Derive the exact query positions from the same tokenized input that will
+        # enter the model. The diagnostic model consumes these positions once, so
+        # fixed instructions remain available to inference but never enter argmax.
+        query_input_positions = find_dataset_query_input_positions(
+            prompt=prompt,
+            input_ids=ranking_inputs["input_ids"],
+            tokenizer=active_processor.tokenizer,
+        )
+        model.set_token_alignment_query_input_positions(query_input_positions)
+        pending_image_grid_thw = torch.as_tensor(
+            ranking_inputs["image_grid_thw"]
+        ).detach().to(device="cpu", dtype=torch.long).contiguous()
+        return ranking_inputs
+
+    def consume_alignment_stats_with_image_grids(
+        active_model,
+        candidate_original_indices,
+    ):
+        nonlocal pending_image_grid_thw
+        if pending_image_grid_thw is None:
+            raise RuntimeError(
+                "No processor image grid is available for the current alignment window"
+            )
+        current_image_grids = pending_image_grid_thw
+        pending_image_grid_thw = None
+        return _consume_qi_token_alignment_stats(
+            active_model,
+            candidate_original_indices,
+            current_image_grids,
+        )
+
     try:
         # Runtime substitution is local to this process. No line in the normal
         # evaluation source file is edited, and the original function is
         # restored even when evaluation raises an exception.
         base_evaluate._consume_qi_similarity_stats = (
-            _consume_qi_token_alignment_stats
+            consume_alignment_stats_with_image_grids
+        )
+        base_evaluate.prepare_ranking_inputs = (
+            prepare_inputs_with_dataset_query_alignment
         )
         results = base_evaluate.evaluate_mmdocir(
             model=model,
@@ -303,6 +403,7 @@ def main() -> None:
         )
     finally:
         base_evaluate._consume_qi_similarity_stats = original_consumer
+        base_evaluate.prepare_ranking_inputs = original_input_preparer
         if log_file is not None:
             log_file.close()
 
@@ -319,6 +420,9 @@ def main() -> None:
         "qi_early_keep_ratio": args.qi_early_keep_ratio,
         "qi_early_temperature": args.qi_early_temperature,
         "effective_qi_early_text_mode": model.qi_early_text_mode,
+        "token_alignment_text_scope": "dataset_query_only",
+        "spatial_merge_size": spatial_merge_size,
+        "retained_patch_overlay_alpha": args.overlay_alpha,
         **selection_metadata,
     }
     output_path = collector.save(args.output_file, run_metadata=run_metadata)
@@ -333,6 +437,9 @@ def main() -> None:
 
     print(json.dumps({
         "output_file": str(output_path),
+        "image_output_directory": str(
+            output_path.parent / f"{output_path.stem}_images"
+        ),
         "queries_exported": len(collector.query_records),
         "skipped_queries": dict(collector.skipped_counts),
     }, ensure_ascii=False, indent=2))
