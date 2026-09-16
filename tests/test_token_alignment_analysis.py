@@ -13,6 +13,8 @@ from models.qwen3vl_with_qi_early_token_alignment import (
 from utils.token_alignment_analysis import (
     TokenAlignmentCollector,
     find_dataset_query_input_positions,
+    select_all_eligible_queries,
+    select_base_diagnostic_records,
     select_eligible_query_subset,
 )
 
@@ -49,13 +51,13 @@ def _image_bytes(width=90, height=30):
 
 class TokenAlignmentCollectorTest(unittest.TestCase):
     @staticmethod
-    def _candidate_stats():
+    def _candidate_stats(num_candidates=3):
         # 三个候选共享同一查询坐标系，但分数和阈值略有差异；这样既覆盖共享
         # 元数据校验，也能确认 collector 没有把不同候选的视觉统计混在一起。
         shared_ids = torch.tensor([10, 11, 99])
         shared_positions = torch.tensor([4, 5, 6])
         records = []
-        for candidate_pos in range(3):
+        for candidate_pos in range(num_candidates):
             records.append({
                 "candidate_pos": candidate_pos,
                 "scores": torch.tensor([0.1, 0.2, 0.3]) + candidate_pos * 0.01,
@@ -134,6 +136,126 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         self.assertEqual(most_common["matched_kept_visual_token_count"], 1)
         self.assertEqual(most_common["matched_pruned_visual_token_count"], 1)
 
+    def test_optional_collection_keeps_base_pair_and_adds_all_errors_before_gt(self):
+        collector = TokenAlignmentCollector(
+            tokenizer=_FakeTokenizer(),
+            image_binary_loader=lambda _global_idx: _image_bytes(),
+            spatial_merge_size=1,
+            collect_incorrect_before_correct=True,
+        )
+        result = {
+            **self._result(),
+            "page_id": [4],
+            "top_k_global_indices": [101, 102, 103, 104],
+            # Wrong candidates occupy final ranks 1 and 2; the best GT is rank 3.
+            "ranked_indices": [1, 0, 3, 2],
+        }
+        collector.add_query(result, self._candidate_stats(num_candidates=4))
+
+        query_record = collector.query_records[0]
+        self.assertEqual(len(query_record["candidates"]), 2)
+        correct, highest_incorrect = query_record["candidates"]
+        self.assertEqual(correct["final_rank"], 3)
+        self.assertEqual(highest_incorrect["final_rank"], 1)
+
+        additional = query_record[
+            "additional_incorrect_candidates_before_correct"
+        ]
+        self.assertTrue(
+            query_record["incorrect_candidates_before_correct_complete"]
+        )
+        self.assertEqual(len(additional), 1)
+        self.assertEqual(additional[0]["role"], "incorrect_ranked_before_correct")
+        self.assertEqual(additional[0]["candidate_pos"], 0)
+        self.assertEqual(additional[0]["final_rank"], 2)
+
+    def test_default_collection_does_not_add_outcome_extension_fields(self):
+        collector = TokenAlignmentCollector(
+            tokenizer=_FakeTokenizer(),
+            image_binary_loader=lambda _global_idx: _image_bytes(),
+            spatial_merge_size=1,
+        )
+        collector.add_query(self._result(), self._candidate_stats())
+
+        query_record = collector.query_records[0]
+        self.assertNotIn(
+            "additional_incorrect_candidates_before_correct",
+            query_record,
+        )
+        self.assertNotIn(
+            "incorrect_candidates_before_correct_complete",
+            query_record,
+        )
+
+    def test_base_record_selection_restores_sample_order_and_strips_extensions(self):
+        all_records = [
+            {
+                "doc_name": "doc",
+                "q_idx": 0,
+                "marker": "dataset_first",
+                "additional_incorrect_candidates_before_correct": [{"rank": 2}],
+                "incorrect_candidates_before_correct_complete": True,
+            },
+            {
+                "doc_name": "doc",
+                "q_idx": 1,
+                "marker": "dataset_second",
+                "additional_incorrect_candidates_before_correct": [],
+                "incorrect_candidates_before_correct_complete": True,
+            },
+        ]
+        sampled_results = {
+            "second": {"doc_name": "doc", "q_idx": 1},
+            "first": {"doc_name": "doc", "q_idx": 0},
+        }
+
+        sampled_records = select_base_diagnostic_records(
+            all_records,
+            sampled_results,
+        )
+
+        self.assertEqual(
+            [record["marker"] for record in sampled_records],
+            ["dataset_second", "dataset_first"],
+        )
+        for record in sampled_records:
+            self.assertNotIn(
+                "additional_incorrect_candidates_before_correct",
+                record,
+            )
+            self.assertNotIn(
+                "incorrect_candidates_before_correct_complete",
+                record,
+            )
+        self.assertIn(
+            "additional_incorrect_candidates_before_correct",
+            all_records[0],
+        )
+
+    def test_json_only_save_does_not_create_image_directory(self):
+        collector = TokenAlignmentCollector(
+            tokenizer=_FakeTokenizer(),
+            image_binary_loader=lambda _global_idx: _image_bytes(),
+            spatial_merge_size=1,
+        )
+        collector.add_query(self._result(), self._candidate_stats())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = collector.save(
+                str(Path(temp_dir) / "all_eligible.json"),
+                run_metadata={"scope": "all_eligible"},
+                write_images=False,
+                total_queries_seen=7,
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["num_queries_exported"], 1)
+            self.assertEqual(payload["total_queries_seen"], 7)
+            self.assertFalse(
+                (Path(temp_dir) / "all_eligible_images").exists()
+            )
+            for candidate in payload["queries"][0]["candidates"]:
+                self.assertNotIn("image_files", candidate)
+
     def test_save_writes_readable_json(self):
         collector = TokenAlignmentCollector(
             tokenizer=_FakeTokenizer(),
@@ -145,14 +267,24 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         # 使用真实临时目录完成一次写入和读回，覆盖 Path 创建、UTF-8 JSON
         # 序列化以及顶层 queries 结构，而不在仓库中留下测试产物。
         with tempfile.TemporaryDirectory() as temp_dir:
+            stale_path = (
+                Path(temp_dir)
+                / "alignment_images"
+                / "query_99_stale"
+                / "stale.txt"
+            )
+            stale_path.parent.mkdir(parents=True)
+            stale_path.write_text("stale", encoding="utf-8")
             output = collector.save(
                 str(Path(temp_dir) / "alignment.json"),
                 run_metadata={"test": True},
+                reset_image_output_directory=True,
             )
             payload = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(payload["schema_version"], 4)
             self.assertEqual(payload["num_queries_exported"], 1)
             self.assertEqual(payload["queries"][0]["qid"], "doc_0")
+            self.assertFalse(stale_path.exists())
 
             # Both selected candidates receive an untouched source image and an
             # overlay. A pixel in retained grid cell 1 must change while image size
@@ -274,6 +406,33 @@ class TokenAlignmentCollectorTest(unittest.TestCase):
         self.assertEqual(metadata_a["required_correct_candidates"], 1)
         self.assertEqual(metadata_a["required_incorrect_candidates"], 1)
         self.assertEqual(metadata_a, metadata_b)
+
+    def test_full_query_selection_scans_every_record_without_early_stop(self):
+        eligible_a = self._result()
+        eligible_b = {**self._result(), "qid": "doc_1", "q_idx": 1}
+        missing_gt = {
+            **self._result(),
+            "qid": "doc_2",
+            "q_idx": 2,
+            "page_id": [8],
+        }
+
+        selected, metadata = select_all_eligible_queries({
+            "a": eligible_a,
+            "missing": missing_gt,
+            "b": eligible_b,
+        })
+
+        self.assertEqual(list(selected), ["a", "b"])
+        self.assertEqual(metadata["selected_queries"], 2)
+        self.assertEqual(metadata["queries_inspected_before_early_stop"], 3)
+        self.assertEqual(metadata["queries_not_inspected"], 0)
+        self.assertEqual(
+            metadata["prefilter_skipped_queries"][
+                "correct_candidate_missing_from_topk"
+            ],
+            1,
+        )
 
     def test_diagnostic_pruner_records_text_argmax_without_changing_scores(self):
         pruner = QIEarlyTokenAlignmentPruner(keep_ratio=1.0)

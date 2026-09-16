@@ -182,6 +182,77 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             3,
         )
 
+    def test_top1_outcome_summary_uses_requested_candidates_and_statistics(self):
+        collector = TokenSimilarityAnalysisCollector(num_examples=5, seed=7)
+        collector.add_query(
+            self._result(
+                ranked_indices=[2, 0, 1, 3, 4],
+                ground_truth_page_ids=[3],
+            ),
+            self._candidate_stats(),
+        )
+        collector.add_query(
+            self._result(
+                # The highest GT is rank 4, so ranks 1-3 must all contribute as
+                # incorrect candidates; candidate_pos=4 after the GT is excluded.
+                ranked_indices=[0, 1, 3, 2, 4],
+                ground_truth_page_ids=[3],
+            ),
+            self._candidate_stats(),
+        )
+
+        summary = collector._top1_outcome_similarity_summary(keep_ratio=0.5)
+        self.assertEqual(
+            summary["eligible_queries"],
+            {"top1_correct": 1, "top1_incorrect": 1},
+        )
+
+        top1_correct = summary["groups"]["top1_correct"]
+        self.assertEqual(top1_correct["correct_candidates"]["num_candidates"], 1)
+        self.assertEqual(top1_correct["incorrect_candidates"]["num_candidates"], 1)
+        self.assertAlmostEqual(
+            top1_correct["correct_candidates"][
+                "mean_pruning_threshold_similarity"
+            ],
+            0.12,
+        )
+        self.assertAlmostEqual(
+            top1_correct["incorrect_candidates"][
+                "mean_pruning_threshold_similarity"
+            ],
+            0.10,
+        )
+
+        top1_incorrect = summary["groups"]["top1_incorrect"]
+        correct = top1_incorrect["correct_candidates"]
+        incorrect = top1_incorrect["incorrect_candidates"]
+        self.assertEqual(correct["num_candidates"], 1)
+        self.assertEqual(incorrect["num_candidates"], 3)
+        self.assertAlmostEqual(incorrect["mean_candidates_per_query"], 3.0)
+        self.assertAlmostEqual(
+            incorrect["mean_pruning_threshold_similarity"],
+            (0.10 + 0.11 + 0.13) / 3,
+        )
+        self.assertAlmostEqual(incorrect["mean_all_token_similarity"], 0.0133333333)
+        self.assertAlmostEqual(
+            incorrect["mean_all_token_similarity_variance"],
+            0.025,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_all_token_similarity_entropy"]["shannon_bits"],
+            1.5,
+        )
+
+        distribution = incorrect["token_similarity_distribution"]
+        self.assertEqual(distribution["num_query_histograms"], 1)
+        self.assertEqual(len(distribution["mean_density"]), 80)
+        bin_width = summary["bin_edges"][1] - summary["bin_edges"][0]
+        self.assertAlmostEqual(
+            sum(distribution["mean_density"]) * bin_width,
+            1.0,
+            places=5,
+        )
+
     def test_save_writes_per_bin_counts_for_each_candidate_distribution(self):
         collector = TokenSimilarityAnalysisCollector(
             num_examples=5,
@@ -206,6 +277,7 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             )
             with patch("utils.similarity_analysis.ensure_matplotlib_available"), \
                     patch.object(collector, "_plot_overall"), \
+                    patch.object(collector, "_plot_top1_outcome") as plot_outcome, \
                     patch.object(
                         collector,
                         "_plot_examples",
@@ -219,7 +291,11 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             comparison_path = Path(paths["all_query_candidate_summary"])
             self.assertTrue(comparison_path.is_file())
             comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
+            outcome_path = Path(paths["top1_outcome_summary"])
+            self.assertTrue(outcome_path.is_file())
+            outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
             self.assertEqual(plot_examples.call_count, 2)
+            plot_outcome.assert_called_once()
             self.assertEqual(
                 Path(paths["correct_figure_directory"]),
                 Path(temporary_dir) / "recall1_correct_examples_keep50",
@@ -231,6 +307,10 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             self.assertEqual(
                 exported["all_query_candidate_comparison"],
                 comparison,
+            )
+            self.assertEqual(
+                outcome["eligible_queries"]["top1_correct"],
+                1,
             )
 
         self.assertEqual(exported["num_bins"], 80)
@@ -361,6 +441,16 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
         self.assertEqual(collector.comparison_eligible_queries, 0)
         self.assertEqual(
             collector.comparison_skipped_counts[
+                "correct_candidate_missing_from_topk"
+            ],
+            1,
+        )
+        self.assertEqual(
+            collector.outcome_group_query_counts,
+            {"top1_correct": 0, "top1_incorrect": 0},
+        )
+        self.assertEqual(
+            collector.outcome_group_skipped_counts[
                 "correct_candidate_missing_from_topk"
             ],
             1,

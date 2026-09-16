@@ -19,12 +19,15 @@ positions are not trained as ordinary next-token prediction positions.
 
 from __future__ import annotations
 
+import colorsys
 import io
 import json
 import math
+import os
 import random
 import re
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import (
     Any,
@@ -33,13 +36,14 @@ from typing import (
     Dict,
     List,
     Mapping,
+    Optional,
     Protocol,
     Sequence,
     Tuple,
 )
 
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 
 ImageBinaryLoader = Callable[[int], bytes]
@@ -294,6 +298,572 @@ def draw_kept_patch_overlay(
     return Image.alpha_composite(base, overlay).convert("RGB")
 
 
+def _logit_lens_word_color(word_number: int) -> Tuple[int, int, int]:
+    """Return a deterministic, high-contrast color for one query-local word."""
+    hue = (0.08 + int(word_number) * 0.618033988749895) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.72, 0.92)
+    return round(red * 255), round(green * 255), round(blue * 255)
+
+
+_CJK_UNICODE_RANGES = (
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xF900, 0xFAFF),
+    (0x20000, 0x2FA1F),
+)
+
+
+def _required_cjk_codepoints(text: str) -> frozenset:
+    """Return the Chinese/Japanese/Korean ideographs that need real glyphs."""
+    return frozenset(
+        ord(character)
+        for character in str(text)
+        if any(
+            range_start <= ord(character) <= range_end
+            for range_start, range_end in _CJK_UNICODE_RANGES
+        )
+    )
+
+
+@lru_cache(maxsize=64)
+def _font_face_indices(font_path: str) -> Tuple[int, ...]:
+    """Return loadable face indices for a single font or a TTC collection."""
+    maximum_faces = 32 if Path(font_path).suffix.lower() == ".ttc" else 1
+    face_indices = []
+    for face_index in range(maximum_faces):
+        try:
+            ImageFont.truetype(font_path, size=24, index=face_index)
+        except OSError:
+            break
+        face_indices.append(face_index)
+    return tuple(face_indices)
+
+
+def _glyph_signature(font: Any, character: str) -> Tuple[Any, Any, bytes]:
+    """Describe one rendered glyph so missing-glyph boxes can be detected."""
+    mask = font.getmask(character, mode="L")
+    return mask.size, font.getbbox(character), bytes(mask)
+
+
+@lru_cache(maxsize=512)
+def _font_face_supports_codepoints(
+    font_path: str,
+    face_index: int,
+    required_codepoints: Tuple[int, ...],
+) -> bool:
+    """Reject faces that substitute FreeType's .notdef box for Chinese text."""
+    try:
+        font = ImageFont.truetype(font_path, size=32, index=face_index)
+        missing_glyph = _glyph_signature(font, chr(0x10FFFF))
+        return all(
+            _glyph_signature(font, chr(codepoint)) != missing_glyph
+            for codepoint in required_codepoints
+        )
+    except (OSError, UnicodeEncodeError, ValueError):
+        return False
+
+
+@lru_cache(maxsize=1)
+def _discover_installed_cjk_font_paths() -> Tuple[str, ...]:
+    """Find additional CJK fonts in common OS font directories once per run."""
+    font_roots = (
+        Path("C:/Windows/Fonts"),
+        Path("/usr/share/fonts"),
+        Path("/usr/local/share/fonts"),
+        Path("/System/Library/Fonts"),
+        Path("/Library/Fonts"),
+    )
+    cjk_name_markers = (
+        "notosanscjk",
+        "notoserifcjk",
+        "notosanssc",
+        "notoserifsc",
+        "sourcehansans",
+        "sourcehanserif",
+        "droidsansfallback",
+        "wenquanyi",
+        "wqy",
+        "msyh",
+        "simhei",
+        "simsun",
+        "pingfang",
+        "heiti",
+        "songti",
+        "arphic",
+    )
+    discovered = []
+    for font_root in font_roots:
+        if not font_root.is_dir():
+            continue
+        try:
+            for font_path in font_root.rglob("*"):
+                normalized_name = font_path.name.lower().replace("-", "")
+                if (
+                    font_path.suffix.lower() in {".ttf", ".ttc", ".otf"}
+                    and any(marker in normalized_name for marker in cjk_name_markers)
+                ):
+                    discovered.append(str(font_path))
+        except OSError:
+            continue
+    return tuple(dict.fromkeys(discovered))
+
+
+def _candidate_annotation_font_paths(
+    preferred_font_path: Optional[str],
+) -> Tuple[str, ...]:
+    """Order explicit, bundled, common, and dynamically discovered fonts."""
+    configured_font_path = preferred_font_path or os.environ.get(
+        "ZIPRERANK_CJK_FONT"
+    )
+    if configured_font_path:
+        return (str(Path(configured_font_path).expanduser()),)
+
+    bundled_font_path = (
+        Path(__file__).resolve().parent
+        / "fonts"
+        / "NotoSansCJKsc-Regular.otf"
+    )
+    paths = [
+        str(bundled_font_path),
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+        "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+        "/usr/share/fonts/adobe-source-han-sans/SourceHanSansSC-Regular.otf",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        *_discover_installed_cjk_font_paths(),
+    ]
+    return tuple(
+        dict.fromkeys(
+            str(Path(font_path).expanduser())
+            for font_path in paths
+            if font_path
+        )
+    )
+
+
+def _resolve_annotation_font_face(
+    required_text: str,
+    preferred_font_path: Optional[str],
+) -> Optional[Tuple[str, int]]:
+    """Choose a font face that renders every required CJK character."""
+    configured_font_path = preferred_font_path or os.environ.get(
+        "ZIPRERANK_CJK_FONT"
+    )
+    if configured_font_path and not Path(configured_font_path).expanduser().is_file():
+        raise FileNotFoundError(
+            "Configured CJK annotation font does not exist: "
+            f"{Path(configured_font_path).expanduser()}"
+        )
+
+    required_codepoints = _required_cjk_codepoints(required_text)
+    for font_path in _candidate_annotation_font_paths(preferred_font_path):
+        if not Path(font_path).is_file():
+            continue
+        for face_index in _font_face_indices(font_path):
+            if not required_codepoints or _font_face_supports_codepoints(
+                font_path,
+                face_index,
+                tuple(sorted(required_codepoints)),
+            ):
+                return font_path, face_index
+
+    if required_codepoints:
+        if configured_font_path:
+            raise RuntimeError(
+                "The configured annotation font does not contain all Chinese "
+                f"characters required by this result: {configured_font_path}. "
+                "Please select a complete CJK font such as Noto Sans CJK SC."
+            )
+        raise RuntimeError(
+            "The Logit Lens legend contains Chinese text, but no installed font "
+            "covers all required CJK glyphs. Install Noto Sans CJK SC, pass "
+            "--annotation_font_path /path/to/NotoSansCJKsc-Regular.otf, or set "
+            "ZIPRERANK_CJK_FONT to a compatible .ttf/.ttc/.otf file."
+        )
+    return None
+
+
+@lru_cache(maxsize=64)
+def _load_font_face(font_path: str, face_index: int, size: int) -> Any:
+    """Cache PIL font objects because each query exports many layer maps."""
+    return ImageFont.truetype(
+        font_path,
+        size=max(8, int(size)),
+        index=int(face_index),
+    )
+
+
+def _load_patch_annotation_font(
+    size: int,
+    required_text: str = "",
+    preferred_font_path: Optional[str] = None,
+) -> Any:
+    """Load a verified CJK-capable font instead of silently drawing tofu boxes."""
+    resolved_face = _resolve_annotation_font_face(
+        required_text, preferred_font_path
+    )
+    if resolved_face is not None:
+        font_path, face_index = resolved_face
+        return _load_font_face(font_path, face_index, max(8, int(size)))
+
+    # This branch is reached only when the text has no CJK characters and the
+    # machine has no matching system font, so Pillow's ASCII fallback is safe.
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=max(8, int(size)))
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _short_legend_text(value: Any, max_characters: int = 42) -> str:
+    """Make whitespace and tokenizer markers visible without an oversized legend."""
+    visible = json.dumps("" if value is None else str(value), ensure_ascii=False)
+    if len(visible) <= max_characters:
+        return visible
+    return f"{visible[:max_characters - 3]}..."
+
+
+def _fit_patch_label(
+    draw: Any,
+    label_options: Sequence[Tuple[str, str]],
+    maximum_width: int,
+    maximum_height: int,
+    initial_font_size: int,
+    annotation_font_path: Optional[str],
+) -> Tuple[str, str, Any, Tuple[int, int, int, int], int, bool]:
+    """Fit the most informative available label into one retained patch.
+
+    Options are ordered by information content.  The detailed map therefore
+    tries ``W# + logit`` first, then ``W#``, and finally the numeric portion of
+    the W label.  Font size is reduced with a bounded binary search before any
+    information is dropped.
+    """
+    minimum_font_size = 5
+    maximum_width = max(1, int(maximum_width))
+    maximum_height = max(1, int(maximum_height))
+
+    for label_kind, label in label_options:
+        lower = minimum_font_size
+        upper = max(minimum_font_size, int(initial_font_size))
+        best_result = None
+        while lower <= upper:
+            font_size = (lower + upper) // 2
+            stroke_width = 2 if font_size >= 9 else 1
+            font = _load_patch_annotation_font(
+                font_size, preferred_font_path=annotation_font_path
+            )
+            text_box = draw.multiline_textbbox(
+                (0, 0),
+                label,
+                font=font,
+                spacing=1,
+                stroke_width=stroke_width,
+            )
+            text_width = text_box[2] - text_box[0]
+            text_height = text_box[3] - text_box[1]
+            if text_width <= maximum_width and text_height <= maximum_height:
+                best_result = (
+                    label_kind,
+                    label,
+                    font,
+                    text_box,
+                    stroke_width,
+                    True,
+                )
+                lower = font_size + 1
+            else:
+                upper = font_size - 1
+        if best_result is not None:
+            return best_result
+
+    # Extremely small cells may not hold even a five-pixel numeric label. Draw
+    # it centered anyway instead of silently making a retained patch look as if
+    # it has no Logit Lens result. Such cases are counted in the image subtitle.
+    label_kind, label = label_options[-1]
+    font = _load_patch_annotation_font(
+        minimum_font_size, preferred_font_path=annotation_font_path
+    )
+    text_box = draw.multiline_textbbox(
+        (0, 0), label, font=font, spacing=1, stroke_width=1
+    )
+    return label_kind, label, font, text_box, 1, False
+
+
+def draw_logit_lens_word_patch_map(
+    image: Image.Image,
+    layer_record: Mapping[str, Any],
+    word_registry: Mapping[int, Mapping[str, Any]],
+    image_grid_thw: Sequence[int],
+    spatial_merge_size: int,
+    fill_alpha: int = 72,
+    show_top1_logit: bool = False,
+    annotation_font_path: Optional[str] = None,
+    patch_label_mode: str = "one_per_word",
+) -> Image.Image:
+    """Draw retained patches using query-consistent Top-1 vocabulary colors.
+
+    ``word_registry`` is deliberately shared by every candidate and sampled
+    layer belonging to one query.  Consequently, labels such as ``W3`` and
+    their colors keep exactly the same meaning across all exported images for
+    that query.  Pruned cells receive neither a color nor a word label.
+    """
+    if not 0 <= fill_alpha <= 255:
+        raise ValueError(f"fill_alpha must be in [0, 255], got {fill_alpha}")
+    if patch_label_mode not in {"one_per_word", "all"}:
+        raise ValueError(
+            "patch_label_mode must be 'one_per_word' or 'all', got "
+            f"{patch_label_mode!r}"
+        )
+
+    grid_t, grid_h, grid_w = merged_visual_grid_shape(
+        image_grid_thw, spatial_merge_size
+    )
+    if grid_t != 1:
+        raise ValueError(
+            "Static page visualization expects image_grid_thw[0] == 1, got "
+            f"{grid_t}"
+        )
+
+    # Small source images are enlarged just enough for patch labels to remain
+    # legible.  Normal document pages retain their original resolution.
+    source = image.convert("RGB")
+    cell_width = source.width / grid_w
+    cell_height = source.height / grid_h
+    target_cell_size = 42 if show_top1_logit else 30
+    requested_scale = target_cell_size / max(1.0, min(cell_width, cell_height))
+    maximum_scale = max(1.0, min(3.0, 4500.0 / max(source.size)))
+    render_scale = min(maximum_scale, max(1.0, requested_scale))
+    if render_scale > 1.0:
+        resampling = getattr(
+            getattr(Image, "Resampling", object()), "LANCZOS", 1
+        )
+        rendered_size = (
+            round(source.width * render_scale),
+            round(source.height * render_scale),
+        )
+        source = source.resize(rendered_size, resample=resampling)
+
+    base = source.convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+    cell_width = base.width / grid_w
+    cell_height = base.height / grid_h
+
+    # The complete grid provides spatial context, while only retained tokens
+    # receive the vocabulary-dependent fill, border, and compact W label.
+    for column in range(1, grid_w):
+        x = round(column * base.width / grid_w)
+        draw.line([(x, 0), (x, base.height)], fill=(255, 255, 255, 48), width=1)
+    for row in range(1, grid_h):
+        y = round(row * base.height / grid_h)
+        draw.line([(0, y), (base.width, y)], fill=(255, 255, 255, 48), width=1)
+
+    label_font_size = max(
+        9,
+        round(min(cell_width, cell_height) * (0.25 if show_top1_logit else 0.32)),
+    )
+    outline_width = max(1, round(min(cell_width, cell_height) * 0.045))
+    used_token_counts: Counter[int] = Counter()
+    label_fallback_counts: Counter[str] = Counter()
+
+    # Repeated Top-1 words share one color, so printing W# on every matching
+    # patch adds clutter without adding vocabulary information. In the compact
+    # default mode, the highest-logit patch is the single labeled representative
+    # for that word; all matching patches remain colored and counted in legend.
+    predictions = list(layer_record["token_predictions"])
+    if patch_label_mode == "one_per_word":
+        representative_by_token: Dict[int, Tuple[float, int, int]] = {}
+        for prediction_index, prediction in enumerate(predictions):
+            top1 = prediction["top_vocabulary"][0]
+            token_id = int(top1["token_id"])
+            ranking = (
+                float(top1["logit"]),
+                -int(prediction["original_visual_token_index"]),
+                prediction_index,
+            )
+            if token_id not in representative_by_token or ranking > (
+                representative_by_token[token_id]
+            ):
+                representative_by_token[token_id] = ranking
+        labeled_prediction_indices = {
+            ranking[2] for ranking in representative_by_token.values()
+        }
+    else:
+        labeled_prediction_indices = set(range(len(predictions)))
+
+    for prediction_index, prediction in enumerate(predictions):
+        vocabulary = prediction.get("top_vocabulary", [])
+        if not vocabulary:
+            raise ValueError("A retained patch has no Logit Lens vocabulary result")
+        top1 = vocabulary[0]
+        token_id = int(top1["token_id"])
+        if token_id not in word_registry:
+            raise KeyError(f"Top-1 token ID {token_id} is missing from word_registry")
+
+        word_info = word_registry[token_id]
+        color = tuple(int(channel) for channel in word_info["color_rgb"])
+        visual_token_index = int(prediction["original_visual_token_index"])
+        geometry = visual_token_patch_geometry(
+            visual_token_index,
+            image_grid_thw,
+            spatial_merge_size,
+            base.size,
+        )
+        x0, y0, x1, y1 = geometry["source_image_pixel_box_xyxy"]
+        draw.rectangle(
+            [x0, y0, max(x0, x1 - 1), max(y0, y1 - 1)],
+            fill=(*color, fill_alpha),
+            outline=(*color, 255),
+            width=outline_width,
+        )
+
+        used_token_counts[token_id] += 1
+        if prediction_index not in labeled_prediction_indices:
+            continue
+
+        word_label = str(word_info["word_label"])
+        numeric_label = word_label[1:] if word_label.startswith("W") else word_label
+        if show_top1_logit:
+            label_options = (
+                ("word_and_logit", f"{word_label}\n{float(top1['logit']):.2f}"),
+                ("word_only", word_label),
+                ("numeric_only", numeric_label),
+            )
+        else:
+            label_options = (
+                ("word_only", word_label),
+                ("numeric_only", numeric_label),
+            )
+        (
+            label_kind,
+            patch_label,
+            patch_font,
+            text_box,
+            text_stroke_width,
+            label_fits,
+        ) = _fit_patch_label(
+            draw,
+            label_options,
+            maximum_width=(x1 - x0) - 2,
+            maximum_height=(y1 - y0) - 2,
+            initial_font_size=label_font_size,
+            annotation_font_path=annotation_font_path,
+        )
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+        text_x = x0 + ((x1 - x0) - text_width) / 2
+        text_y = y0 + ((y1 - y0) - text_height) / 2 - text_box[1]
+        draw.multiline_text(
+            (text_x, text_y),
+            patch_label,
+            font=patch_font,
+            fill=(255, 255, 255, 255),
+            spacing=1,
+            align="center",
+            stroke_width=text_stroke_width,
+            stroke_fill=(0, 0, 0, 230),
+        )
+        if label_kind != label_options[0][0] or not label_fits:
+            fallback_key = label_kind if label_fits else "forced_numeric"
+            label_fallback_counts[fallback_key] += 1
+
+    annotated = Image.alpha_composite(base, overlay).convert("RGB")
+
+    # Append a legend instead of writing full vocabulary strings directly into
+    # patches.  This keeps dense page regions readable and makes the same W label
+    # easy to compare between the four candidates and four sampled layers.
+    used_token_ids = sorted(
+        used_token_counts,
+        key=lambda registry_token_id: int(
+            word_registry[registry_token_id]["word_number"]
+        ),
+    )
+    legend_required_text = "".join(
+        str(word_registry[token_id].get("decoded_text") or "")
+        + str(word_registry[token_id].get("vocab_token") or "")
+        for token_id in used_token_ids
+    )
+    legend_font = _load_patch_annotation_font(
+        14,
+        required_text=legend_required_text,
+        preferred_font_path=annotation_font_path,
+    )
+    title_font = _load_patch_annotation_font(
+        19, preferred_font_path=annotation_font_path
+    )
+    legend_line_height = 42
+    legend_header_height = 72
+    rows_that_fit_image = max(
+        18,
+        min(48, (annotated.height - legend_header_height - 24) // legend_line_height),
+    )
+    legend_columns = max(1, math.ceil(len(used_token_ids) / rows_that_fit_image))
+    rows_per_column = max(1, math.ceil(len(used_token_ids) / legend_columns))
+    legend_column_width = 440
+    legend_width = legend_columns * legend_column_width + 32
+    legend_height = legend_header_height + rows_per_column * legend_line_height + 24
+    canvas = Image.new(
+        "RGB",
+        (annotated.width + legend_width, max(annotated.height, legend_height)),
+        (248, 248, 248),
+    )
+    canvas.paste(annotated, (0, 0))
+    legend_draw = ImageDraw.Draw(canvas)
+    legend_x = annotated.width + 18
+    layer_number = int(layer_record["layer_number_one_based"])
+    legend_draw.text(
+        (legend_x, 12),
+        f"Layer {layer_number}: retained-patch Top-1 vocabulary",
+        font=title_font,
+        fill=(20, 20, 20),
+    )
+    if patch_label_mode == "one_per_word":
+        subtitle = (
+            "one representative W# + raw logit per word"
+            if show_top1_logit
+            else "one representative W# per word"
+        )
+    else:
+        subtitle = (
+            "patch label = W# + raw logit"
+            if show_top1_logit
+            else "patch label = W#"
+        )
+    fallback_total = sum(label_fallback_counts.values())
+    if fallback_total:
+        subtitle += f"; {fallback_total} tiny patches use a shorter label"
+    legend_draw.text(
+        (legend_x, 43), subtitle, font=legend_font, fill=(80, 80, 80)
+    )
+
+    for entry_index, token_id in enumerate(used_token_ids):
+        column = entry_index // rows_per_column
+        row = entry_index % rows_per_column
+        x = legend_x + column * legend_column_width
+        y = legend_header_height + row * legend_line_height
+        word_info = word_registry[token_id]
+        color = tuple(int(channel) for channel in word_info["color_rgb"])
+        legend_draw.rectangle([x, y + 5, x + 18, y + 23], fill=color, outline=(0, 0, 0))
+        first_line = (
+            f"{word_info['word_label']} ({used_token_counts[token_id]} patches) "
+            f"text={_short_legend_text(word_info.get('decoded_text'), 28)}"
+        )
+        second_line = (
+            f"vocab={_short_legend_text(word_info.get('vocab_token'), 30)}"
+        )
+        legend_draw.text((x + 27, y + 1), first_line, font=legend_font, fill=(25, 25, 25))
+        legend_draw.text((x + 27, y + 23), second_line, font=legend_font, fill=(70, 70, 70))
+
+    return canvas
+
+
 class LogitLensVocabularyProjector:
     """Apply the model's final norm and LM head to CPU hidden-state chunks."""
 
@@ -377,15 +947,35 @@ class VisualLogitLensCollector:
         spatial_merge_size: int,
         summary_top_tokens: int = 20,
         overlay_alpha: int = 72,
+        annotation_font_path: Optional[str] = None,
+        patch_label_mode: str = "one_per_word",
     ) -> None:
         if summary_top_tokens <= 0:
             raise ValueError("summary_top_tokens must be positive")
+        if patch_label_mode not in {"one_per_word", "all"}:
+            raise ValueError(
+                "patch_label_mode must be 'one_per_word' or 'all', got "
+                f"{patch_label_mode!r}"
+            )
         self.tokenizer = tokenizer
         self.projector = projector
         self.image_binary_loader = image_binary_loader
         self.spatial_merge_size = int(spatial_merge_size)
         self.summary_top_tokens = summary_top_tokens
         self.overlay_alpha = overlay_alpha
+        self.annotation_font_path = annotation_font_path
+        self.patch_label_mode = patch_label_mode
+
+        # Validate an explicitly configured path before model inference starts.
+        # Actual CJK glyph coverage is checked later against each layer's words.
+        configured_font_path = annotation_font_path or os.environ.get(
+            "ZIPRERANK_CJK_FONT"
+        )
+        if configured_font_path and not Path(configured_font_path).expanduser().is_file():
+            raise FileNotFoundError(
+                "Configured CJK annotation font does not exist: "
+                f"{Path(configured_font_path).expanduser()}"
+            )
 
         self.query_records: List[Dict[str, Any]] = []
         self.total_queries_seen = 0
@@ -694,12 +1284,55 @@ class VisualLogitLensCollector:
         cleaned = re.sub(r"[^\w.-]+", "_", str(value), flags=re.UNICODE).strip("._")
         return (cleaned or fallback)[:100]
 
+    @staticmethod
+    def _build_query_word_registry(
+        query_record: Dict[str, Any],
+    ) -> Dict[int, Dict[str, Any]]:
+        """Assign query-wide W labels and colors to every observed Top-1 token."""
+        word_registry: Dict[int, Dict[str, Any]] = {}
+
+        # Traversal order is deterministic: candidates follow final-rank-based
+        # selection order, layers are already sorted, and patches retain their
+        # original visual-token order.  First occurrence therefore gives stable
+        # compact W labels without exposing long vocabulary strings on patches.
+        for candidate_record in query_record["candidates"]:
+            for layer_record in candidate_record["logit_lens_layers"]:
+                for prediction in layer_record["token_predictions"]:
+                    vocabulary = prediction.get("top_vocabulary", [])
+                    if not vocabulary:
+                        raise ValueError(
+                            "A retained patch has no Logit Lens vocabulary result"
+                        )
+                    top1 = vocabulary[0]
+                    token_id = int(top1["token_id"])
+                    if token_id in word_registry:
+                        continue
+
+                    word_number = len(word_registry)
+                    word_registry[token_id] = {
+                        "word_number": word_number,
+                        "word_label": f"W{word_number}",
+                        "token_id": token_id,
+                        "vocab_token": top1.get("vocab_token"),
+                        "decoded_text": top1.get("decoded_text", ""),
+                        "is_special_token": bool(
+                            top1.get("is_special_token", False)
+                        ),
+                        "color_rgb": list(_logit_lens_word_color(word_number)),
+                    }
+
+        query_record["logit_lens_word_legend"] = [
+            dict(word_info) for word_info in word_registry.values()
+        ]
+        return word_registry
+
     def _write_candidate_images(
         self,
         output_path: Path,
         query_index: int,
         query_record: Dict[str, Any],
         candidate_record: Dict[str, Any],
+        word_registry: Mapping[int, Mapping[str, Any]],
     ) -> None:
         qid_component = self._safe_path_component(
             query_record["qid"], f"query_{query_index:02d}"
@@ -730,10 +1363,54 @@ class VisualLogitLensCollector:
         )
         annotated.save(overlay_path, format="PNG")
 
-        candidate_record["image_files"] = {
+        image_files: Dict[str, Any] = {
             "original": original_path.relative_to(output_path).as_posix(),
             "kept_patch_overlay": overlay_path.relative_to(output_path).as_posix(),
         }
+
+        # Each sampled layer receives a compact Top-1 map and a second detailed
+        # map whose patch label also includes the raw logit.  Both share the
+        # query-wide registry, so W3 means the same vocabulary token everywhere.
+        word_maps_by_layer: Dict[str, Dict[str, str]] = {}
+        for layer_record in candidate_record["logit_lens_layers"]:
+            layer_number = int(layer_record["layer_number_one_based"])
+            layer_key = str(layer_number)
+            filename_prefix = f"layer_{layer_number:02d}"
+            top1_map_path = candidate_dir / f"{filename_prefix}_top1_word_map.png"
+            detail_map_path = candidate_dir / f"{filename_prefix}_word_details.png"
+
+            top1_map = draw_logit_lens_word_patch_map(
+                source_image,
+                layer_record,
+                word_registry,
+                candidate_record["image_grid_thw_before_spatial_merge"],
+                candidate_record["spatial_merge_size"],
+                fill_alpha=self.overlay_alpha,
+                show_top1_logit=False,
+                annotation_font_path=self.annotation_font_path,
+                patch_label_mode=self.patch_label_mode,
+            )
+            top1_map.save(top1_map_path, format="PNG")
+
+            detail_map = draw_logit_lens_word_patch_map(
+                source_image,
+                layer_record,
+                word_registry,
+                candidate_record["image_grid_thw_before_spatial_merge"],
+                candidate_record["spatial_merge_size"],
+                fill_alpha=self.overlay_alpha,
+                show_top1_logit=True,
+                annotation_font_path=self.annotation_font_path,
+                patch_label_mode=self.patch_label_mode,
+            )
+            detail_map.save(detail_map_path, format="PNG")
+            word_maps_by_layer[layer_key] = {
+                "top1_word_map": top1_map_path.relative_to(output_path).as_posix(),
+                "word_details": detail_map_path.relative_to(output_path).as_posix(),
+            }
+
+        image_files["logit_lens_word_maps_by_layer"] = word_maps_by_layer
+        candidate_record["image_files"] = image_files
 
     @staticmethod
     def _compact_vocabulary_word(vocabulary_record: Mapping[str, Any]) -> str:
@@ -859,6 +1536,16 @@ class VisualLogitLensCollector:
             "query": query_record["query"],
             "ground_truth_page_ids": query_record["ground_truth_page_ids"],
             "recall_at_1_correct": query_record["recall_at_1_correct"],
+            "logit_lens_word_legend": [
+                {
+                    "word_label": word_info["word_label"],
+                    "vocab_token": word_info["vocab_token"],
+                    "decoded_text": word_info["decoded_text"],
+                    "is_special_token": word_info["is_special_token"],
+                    "color_rgb": word_info["color_rgb"],
+                }
+                for word_info in query_record["logit_lens_word_legend"]
+            ],
             "candidates": [
                 self._compact_candidate_record(candidate_record)
                 for candidate_record in query_record["candidates"]
@@ -875,21 +1562,23 @@ class VisualLogitLensCollector:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Image paths are inserted into candidate records before JSON emission so
-        # every analysis row directly links its vocabulary results to both the
-        # untouched source page and the spatial overlay derived from it.
+        # Image paths and the query-wide word registry are inserted before JSON
+        # emission.  Every candidate can therefore link directly to its source,
+        # pruning overlay, and layer-specific vocabulary maps.
         for query_index, query_record in enumerate(self.query_records, start=1):
+            word_registry = self._build_query_word_registry(query_record)
             for candidate_record in query_record["candidates"]:
                 self._write_candidate_images(
                     output_path,
                     query_index,
                     query_record,
                     candidate_record,
+                    word_registry,
                 )
 
         json_path = output_path / "visual_logit_lens_analysis.json"
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "description": (
                 "Compact late-layer Logit Lens words and pruning status for every "
                 "visual token from one highest-ranked GT and three highest-ranked "
@@ -904,7 +1593,8 @@ class VisualLogitLensCollector:
                 "operation": "final language-model RMSNorm followed by lm_head",
                 "stored_result": (
                     "decoded Top-K words ordered by raw logit; token IDs and logit "
-                    "values are omitted"
+                    "values are omitted from JSON, while detail images display the "
+                    "Top-1 raw logit"
                 ),
                 "layer_key": "one-based decoder block number stored as a JSON key",
                 "token_position": (
@@ -921,6 +1611,18 @@ class VisualLogitLensCollector:
                 "overlay": (
                     "green/yellow cells are the actual QI-Early retained tokens; "
                     "faint white lines show the complete merged grid"
+                ),
+                "logit_lens_word_maps": (
+                    "only retained cells are colored; W labels and colors use the "
+                    "query-level logit_lens_word_legend and stay consistent across "
+                    "all four candidates and sampled layers"
+                ),
+                "patch_label_mode": self.patch_label_mode,
+                "word_details": (
+                    "one_per_word labels only the highest-logit representative patch "
+                    "for each Top-1 vocabulary word; all matching retained patches "
+                    "keep the same color. Fonts shrink per labeled patch, and "
+                    "exceptionally small cells prioritize W# or its numeric portion"
                 ),
             },
             "run": dict(run_metadata),

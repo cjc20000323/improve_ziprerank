@@ -31,6 +31,8 @@ from scripts import evaluate as base_evaluate  # noqa: E402
 from utils.token_alignment_analysis import (  # noqa: E402
     TokenAlignmentCollector,
     find_dataset_query_input_positions,
+    select_all_eligible_queries,
+    select_base_diagnostic_records,
     select_eligible_query_subset,
 )
 
@@ -60,6 +62,31 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=20,
         help="Number of eligible queries to sample uniformly (default: 20).",
+    )
+    parser.add_argument(
+        "--all_eligible_queries",
+        action="store_true",
+        help=(
+            "Also analyze every eligible query and save those records to a "
+            "separate JSON without images. --output_file and its images still "
+            "contain only the seeded --num_queries sample."
+        ),
+    )
+    parser.add_argument(
+        "--all_eligible_output_file",
+        default=None,
+        help=(
+            "JSON-only output for --all_eligible_queries. By default, append "
+            "_all_eligible to the stem of --output_file."
+        ),
+    )
+    parser.add_argument(
+        "--collect_incorrect_before_correct",
+        action="store_true",
+        help=(
+            "Additionally serialize every non-GT candidate ranked ahead of the "
+            "highest-ranked GT. The original two-candidate output remains unchanged."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -240,10 +267,35 @@ def _open_log(path: Optional[str], args: argparse.Namespace):
     handle.write("TOKEN ALIGNMENT DIAGNOSTIC - ZipRerank\n")
     handle.write("=" * 80 + "\n")
     handle.write(f"Model: {args.model_path}\n")
-    handle.write(f"Queries: {args.num_queries}\n")
+    query_scope = "all eligible" if args.all_eligible_queries else args.num_queries
+    handle.write(f"Queries: {query_scope}\n")
     handle.write(f"Keep ratio: {args.qi_early_keep_ratio}\n")
     handle.flush()
     return handle
+
+
+def _all_eligible_output_path(args: argparse.Namespace) -> Optional[Path]:
+    """Resolve the separate JSON-only output used by corpus-level statistics."""
+    if not args.all_eligible_queries:
+        if args.all_eligible_output_file is not None:
+            raise ValueError(
+                "--all_eligible_output_file requires --all_eligible_queries"
+            )
+        return None
+
+    base_path = Path(args.output_file)
+    if args.all_eligible_output_file is not None:
+        all_path = Path(args.all_eligible_output_file)
+    else:
+        suffix = base_path.suffix or ".json"
+        all_path = base_path.with_name(
+            f"{base_path.stem}_all_eligible{suffix}"
+        )
+    if base_path.resolve() == all_path.resolve():
+        raise ValueError(
+            "--all_eligible_output_file must differ from --output_file"
+        )
+    return all_path
 
 
 def main() -> None:
@@ -254,6 +306,7 @@ def main() -> None:
         raise ValueError("--qi_early_keep_ratio must be in (0, 1]")
     if not 0 <= args.overlay_alpha <= 255:
         raise ValueError("--overlay_alpha must be in [0, 255]")
+    all_eligible_output_path = _all_eligible_output_path(args)
 
     print("Loading MMDocIR page parquet...")
     parquet_df = pd.read_parquet(args.pages_parquet)
@@ -264,13 +317,21 @@ def main() -> None:
         args.first_stage_file
     )
 
-    # 先过滤再随机抽样，保证每个入选 query 都能导出一个最高排名 GT 和一个
-    # 最高排名非 GT；使用独立 seed 后，同一输入文件上的诊断样本可重复获得。
-    selected_results, selection_metadata = select_eligible_query_subset(
+    # 无论是否启用全量统计，都先按原逻辑确定主 JSON 的固定 seed 样本。全量
+    # 模式只扩大模型实际处理的集合，之后再把这批样本抽回主文件和图片目录。
+    sampled_results, sample_selection_metadata = select_eligible_query_subset(
         first_stage_results,
         num_queries=args.num_queries,
         seed=args.seed,
     )
+    if args.all_eligible_queries:
+        selected_results, selection_metadata = select_all_eligible_queries(
+            first_stage_results
+        )
+    else:
+        selected_results = sampled_results
+        selection_metadata = sample_selection_metadata
+    expected_inference_queries = len(selected_results)
     max_candidates = max(
         len(item["top_k_global_indices"]) for item in selected_results.values()
     )
@@ -282,11 +343,13 @@ def main() -> None:
             "Token alignment requires one reranking window per query, but the "
             f"selected queries contain up to {max_candidates} candidates and "
             f"--window_size={args.window_size}. Increase --window_size."
-    )
+        )
+    selection_seed = selection_metadata.get("selection_seed")
+    seed_note = f", seed={selection_seed}" if selection_seed is not None else ""
     print(
         f"Found {len(selected_results)} eligible queries after inspecting "
-        f"{selection_metadata['queries_inspected_before_early_stop']} entries "
-        f"(seed={args.seed})"
+        f"{selection_metadata['queries_inspected_before_early_stop']} entries"
+        f" ({selection_metadata['selection_method']}{seed_note})"
     )
 
     print(f"Loading diagnostic model from {args.model_path}...")
@@ -321,6 +384,9 @@ def main() -> None:
         image_binary_loader=load_image_binary,
         spatial_merge_size=spatial_merge_size,
         overlay_alpha=args.overlay_alpha,
+        collect_incorrect_before_correct=(
+            args.collect_incorrect_before_correct or args.all_eligible_queries
+        ),
     )
     base_evaluate._inference_timer = base_evaluate.InferenceTimer(model)
     base_evaluate._eval_stats = base_evaluate.EvalStats(
@@ -407,14 +473,12 @@ def main() -> None:
         if log_file is not None:
             log_file.close()
 
-    # 运行参数与抽样条件和逐 token 结果写在同一个 JSON 中，便于之后判断两次
-    # 分析是否使用了相同配置，而不必依赖终端输出或另存的日志文件。
-    run_metadata = {
+    # 主文件沿用原 20 条采样元数据；全量文件记录完整扫描信息。两者共享模型
+    # 配置，但候选扩展标记只进入全量文件，避免改变原诊断 JSON 的既有语义。
+    common_run_metadata = {
         "model_path": args.model_path,
         "first_stage_file": args.first_stage_file,
         "pages_parquet": args.pages_parquet,
-        "requested_queries": args.num_queries,
-        "evaluated_queries": len(results),
         "window_size": args.window_size,
         "reranking_mode": "first-token logits" if args.use_logits else "generation",
         "qi_early_keep_ratio": args.qi_early_keep_ratio,
@@ -423,26 +487,84 @@ def main() -> None:
         "token_alignment_text_scope": "dataset_query_only",
         "spatial_merge_size": spatial_merge_size,
         "retained_patch_overlay_alpha": args.overlay_alpha,
-        **selection_metadata,
     }
-    output_path = collector.save(args.output_file, run_metadata=run_metadata)
+    sample_run_metadata = {
+        **common_run_metadata,
+        "requested_queries": len(sampled_results),
+        "evaluated_queries": len(sampled_results),
+        **sample_selection_metadata,
+    }
+    if args.collect_incorrect_before_correct and not args.all_eligible_queries:
+        sample_run_metadata["collect_incorrect_before_correct"] = True
 
-    # collector 对不满足条件的 query 会选择跳过。脚本要求精确导出指定数量，
-    # 因此先保存可诊断的部分结果，再用异常明确提示本次运行并未完整成功。
-    if len(collector.query_records) != args.num_queries:
+    if len(collector.query_records) != expected_inference_queries:
+        partial_target = all_eligible_output_path or Path(args.output_file)
+        partial_metadata = {
+            **common_run_metadata,
+            "requested_queries": expected_inference_queries,
+            "evaluated_queries": len(results),
+            **selection_metadata,
+        }
+        partial_path = collector.save(
+            str(partial_target),
+            run_metadata=partial_metadata,
+            write_images=not args.all_eligible_queries,
+        )
         raise RuntimeError(
-            f"Expected {args.num_queries} exported queries, got "
-            f"{len(collector.query_records)}; partial output was saved to {output_path}"
+            f"Expected {expected_inference_queries} exported queries, got "
+            f"{len(collector.query_records)}; partial output was saved to "
+            f"{partial_path}"
         )
 
-    print(json.dumps({
+    saved_all_eligible_path = None
+    if args.all_eligible_queries:
+        all_run_metadata = {
+            **common_run_metadata,
+            "requested_queries": expected_inference_queries,
+            "evaluated_queries": len(results),
+            "requested_all_eligible_queries": True,
+            "collect_incorrect_before_correct": True,
+            **selection_metadata,
+        }
+        # 先写不含图片路径的全量 JSON；随后对 20 条深拷贝生成图片，不会反向
+        # 污染这里的全量记录，也不会为其余查询创建庞大的可视化目录。
+        saved_all_eligible_path = collector.save(
+            str(all_eligible_output_path),
+            run_metadata=all_run_metadata,
+            write_images=False,
+            total_queries_seen=expected_inference_queries,
+        )
+        base_query_records = select_base_diagnostic_records(
+            collector.query_records,
+            sampled_results,
+        )
+    else:
+        base_query_records = collector.query_records
+
+    output_path = collector.save(
+        args.output_file,
+        run_metadata=sample_run_metadata,
+        query_records=base_query_records,
+        write_images=True,
+        total_queries_seen=len(base_query_records),
+        reset_image_output_directory=args.all_eligible_queries,
+    )
+
+    output_summary = {
         "output_file": str(output_path),
         "image_output_directory": str(
             output_path.parent / f"{output_path.stem}_images"
         ),
-        "queries_exported": len(collector.query_records),
+        "queries_exported": len(base_query_records),
         "skipped_queries": dict(collector.skipped_counts),
-    }, ensure_ascii=False, indent=2))
+    }
+    if saved_all_eligible_path is not None:
+        output_summary.update({
+            "all_eligible_output_file": str(saved_all_eligible_path),
+            "all_eligible_queries_exported": len(collector.query_records),
+            "all_eligible_images_generated": False,
+        })
+    print(json.dumps(output_summary, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

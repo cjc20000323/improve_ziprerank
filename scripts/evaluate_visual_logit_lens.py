@@ -126,6 +126,25 @@ def parse_args() -> argparse.Namespace:
         default=72,
         help="Green retained-patch fill opacity in [0, 255].",
     )
+    parser.add_argument(
+        "--annotation_font_path",
+        default=None,
+        help=(
+            "Optional CJK-capable TTF/TTC/OTF font used in patch-map legends. "
+            "When omitted, common Noto/Source Han/Windows/macOS fonts are "
+            "discovered automatically; ZIPRERANK_CJK_FONT is also supported."
+        ),
+    )
+    parser.add_argument(
+        "--patch_label_mode",
+        choices=["one_per_word", "all"],
+        default="one_per_word",
+        help=(
+            "Numbering density in Logit Lens patch maps. one_per_word labels "
+            "only the highest-logit representative patch for each vocabulary "
+            "word; all reproduces the previous label-every-retained-patch view."
+        ),
+    )
     parser.add_argument("--llm_log_file", default=None)
     return parser.parse_args()
 
@@ -347,6 +366,8 @@ def main() -> None:
         spatial_merge_size=spatial_merge_size,
         summary_top_tokens=args.summary_top_tokens,
         overlay_alpha=args.overlay_alpha,
+        annotation_font_path=args.annotation_font_path,
+        patch_label_mode=args.patch_label_mode,
     )
 
     base_evaluate._inference_timer = base_evaluate.InferenceTimer(model)
@@ -414,6 +435,7 @@ def main() -> None:
         "total_decoder_layers": total_decoder_layers,
         "top_k_vocabulary_per_visual_token": args.top_k_vocab,
         "projection_chunk_size": args.projection_chunk_size,
+        "patch_label_mode": args.patch_label_mode,
         "spatial_merge_size": spatial_merge_size,
         **selection_metadata,
     }

@@ -94,6 +94,7 @@ class SimilarityImageExportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_dir, \
                 patch("utils.similarity_analysis.ensure_matplotlib_available"), \
                 patch.object(collector, "_plot_overall"), \
+                patch.object(collector, "_plot_top1_outcome"), \
                 patch.object(collector, "_plot_examples", side_effect=[[], []]), \
                 patch(
                     "utils.similarity_analysis.export_selected_similarity_candidate_images",

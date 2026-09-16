@@ -3,9 +3,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from models.qwen3vl_with_qi_early_logit_lens import (
     select_spaced_late_layer_indices,
@@ -17,6 +18,7 @@ from utils.visual_logit_lens_analysis import (
     LogitLensVocabularyProjector,
     VisualLogitLensCollector,
     draw_kept_patch_overlay,
+    draw_logit_lens_word_patch_map,
     select_visual_logit_lens_query_subset,
     visual_token_patch_geometry,
 )
@@ -179,6 +181,191 @@ class VisualLogitLensAnalysisTest(unittest.TestCase):
         self.assertEqual(annotated.size, source.size)
         self.assertNotEqual(annotated.getpixel((10, 10)), source.getpixel((10, 10)))
 
+    def test_word_patch_map_colors_only_retained_cells_and_appends_legend(self):
+        source = Image.new("RGB", (100, 50), color=(120, 120, 120))
+        layer_record = {
+            "layer_number_one_based": 7,
+            "token_predictions": [
+                {
+                    "original_visual_token_index": 0,
+                    "top_vocabulary": [{"token_id": 10, "logit": 5.0}],
+                },
+                {
+                    "original_visual_token_index": 2,
+                    "top_vocabulary": [{"token_id": 11, "logit": 4.5}],
+                },
+            ],
+        }
+        word_registry = {
+            10: {
+                "word_number": 0,
+                "word_label": "W0",
+                "color_rgb": [220, 70, 70],
+                "decoded_text": "cat",
+                "vocab_token": "cat",
+            },
+            11: {
+                "word_number": 1,
+                "word_label": "W1",
+                "color_rgb": [70, 120, 220],
+                "decoded_text": "dog",
+                "vocab_token": "dog",
+            },
+        }
+
+        annotated = draw_logit_lens_word_patch_map(
+            source,
+            layer_record,
+            word_registry,
+            image_grid_thw=[1, 4, 8],
+            spatial_merge_size=2,
+        )
+
+        # The source pane is enlarged for readable cell labels and a separate
+        # legend pane is appended. Retained cells use distinct word colors,
+        # whereas the unselected cell at original token index 1 stays gray.
+        self.assertGreater(annotated.width, source.width)
+        self.assertGreaterEqual(annotated.height, source.height)
+        self.assertNotEqual(annotated.getpixel((5, 5)), annotated.getpixel((45, 5)))
+        self.assertNotEqual(annotated.getpixel((5, 5)), annotated.getpixel((65, 5)))
+
+    def test_chinese_word_map_uses_verified_cjk_font_or_reports_configuration(self):
+        source = Image.new("RGB", (100, 50), color=(120, 120, 120))
+        layer_record = {
+            "layer_number_one_based": 7,
+            "token_predictions": [{
+                "original_visual_token_index": 0,
+                "top_vocabulary": [{"token_id": 10, "logit": 5.0}],
+            }],
+        }
+        word_registry = {
+            10: {
+                "word_number": 0,
+                "word_label": "W0",
+                "color_rgb": [220, 70, 70],
+                "decoded_text": "中文",
+                "vocab_token": "中文",
+            }
+        }
+
+        # A machine with a CJK font must render the map successfully. A minimal
+        # server image without one must stop with actionable configuration text
+        # instead of silently substituting missing-glyph squares.
+        try:
+            annotated = draw_logit_lens_word_patch_map(
+                source,
+                layer_record,
+                word_registry,
+                image_grid_thw=[1, 4, 8],
+                spatial_merge_size=2,
+            )
+        except RuntimeError as exc:
+            self.assertIn("--annotation_font_path", str(exc))
+        else:
+            self.assertGreater(annotated.width, source.width)
+
+    def test_tiny_retained_patch_still_draws_a_numeric_label(self):
+        source = Image.new("RGB", (8, 4), color=(120, 120, 120))
+        layer_record = {
+            "layer_number_one_based": 7,
+            "token_predictions": [{
+                "original_visual_token_index": 0,
+                "top_vocabulary": [{"token_id": 10, "logit": 123456.78}],
+            }],
+        }
+        word_registry = {
+            10: {
+                "word_number": 1234567890123,
+                "word_label": "W1234567890123",
+                "color_rgb": [220, 70, 70],
+                "decoded_text": "word",
+                "vocab_token": "word",
+            }
+        }
+        rendered_patch_labels = []
+        original_multiline_text = ImageDraw.ImageDraw.multiline_text
+
+        def record_multiline_text(draw, position, text, *args, **kwargs):
+            rendered_patch_labels.append(text)
+            original_multiline_text(draw, position, text, *args, **kwargs)
+
+        # The deliberately long label cannot fit even after font reduction.
+        # The renderer must still draw its compact numeric form instead of
+        # following the old behavior and silently omitting the patch label.
+        with patch.object(
+            ImageDraw.ImageDraw,
+            "multiline_text",
+            new=record_multiline_text,
+        ):
+            draw_logit_lens_word_patch_map(
+                source,
+                layer_record,
+                word_registry,
+                image_grid_thw=[1, 4, 8],
+                spatial_merge_size=2,
+                show_top1_logit=True,
+            )
+
+        self.assertEqual(rendered_patch_labels, ["1234567890123"])
+
+    def test_compact_label_mode_numbers_each_vocabulary_word_once(self):
+        source = Image.new("RGB", (100, 50), color=(120, 120, 120))
+        layer_record = {
+            "layer_number_one_based": 7,
+            "token_predictions": [
+                {
+                    "original_visual_token_index": visual_token_index,
+                    "top_vocabulary": [{"token_id": 10, "logit": logit}],
+                }
+                for visual_token_index, logit in [(0, 1.0), (2, 5.0), (4, 3.0)]
+            ],
+        }
+        word_registry = {
+            10: {
+                "word_number": 0,
+                "word_label": "W0",
+                "color_rgb": [220, 70, 70],
+                "decoded_text": "word",
+                "vocab_token": "word",
+            }
+        }
+        rendered_patch_labels = []
+        original_multiline_text = ImageDraw.ImageDraw.multiline_text
+
+        def record_multiline_text(draw, position, text, *args, **kwargs):
+            rendered_patch_labels.append(text)
+            original_multiline_text(draw, position, text, *args, **kwargs)
+
+        # Three retained patches share the same Top-1 vocabulary word. The
+        # compact default labels only its highest-logit representative, while
+        # all three cells remain colored and contribute to the legend count.
+        with patch.object(
+            ImageDraw.ImageDraw,
+            "multiline_text",
+            new=record_multiline_text,
+        ):
+            draw_logit_lens_word_patch_map(
+                source,
+                layer_record,
+                word_registry,
+                image_grid_thw=[1, 4, 8],
+                spatial_merge_size=2,
+            )
+
+        self.assertEqual(rendered_patch_labels, ["W0"])
+
+    def test_collector_rejects_missing_configured_annotation_font(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            missing_font = Path(temporary_dir) / "missing-cjk-font.otf"
+            with self.assertRaises(FileNotFoundError):
+                VisualLogitLensCollector(
+                    tokenizer=_FakeTokenizer(),
+                    projector=_FakeProjector(),
+                    image_binary_loader=lambda _global_idx: _image_bytes(),
+                    spatial_merge_size=2,
+                    annotation_font_path=str(missing_font),
+                )
+
     def test_projector_matches_direct_final_norm_and_lm_head(self):
         class FakeLanguageModel(torch.nn.Module):
             def __init__(self):
@@ -256,14 +443,20 @@ class VisualLogitLensAnalysisTest(unittest.TestCase):
         )
 
         # Saving exercises the complete artifact layout: four untouched source
-        # images, four overlays and one JSON file with relative image paths.
+        # images, four overlays, per-layer word maps and one JSON file with
+        # relative image paths plus a query-wide W-label legend.
         with tempfile.TemporaryDirectory() as temporary_dir:
             paths = collector.save(temporary_dir, run_metadata={"test": True})
             payload = json.loads(
                 Path(paths["analysis_json"]).read_text(encoding="utf-8")
             )
-            self.assertEqual(payload["schema_version"], 2)
+            self.assertEqual(payload["schema_version"], 3)
             self.assertEqual(payload["num_queries_exported"], 1)
+            query_legend = payload["queries"][0]["logit_lens_word_legend"]
+            self.assertEqual(
+                [entry["word_label"] for entry in query_legend], ["W0", "W1"]
+            )
+            self.assertEqual(query_legend[0]["decoded_text"], "decoded_10")
             compact_candidate = payload["queries"][0]["candidates"][0]
             self.assertNotIn("kept_visual_tokens", compact_candidate)
             self.assertNotIn("logit_lens_layers", compact_candidate)
@@ -281,8 +474,22 @@ class VisualLogitLensAnalysisTest(unittest.TestCase):
             self.assertTrue(pruned_token["pruned"])
             self.assertEqual(pruned_token["logit_lens_words_by_layer"], {})
             for candidate in payload["queries"][0]["candidates"]:
-                for relative_path in candidate["image_files"].values():
-                    self.assertTrue((Path(temporary_dir) / relative_path).is_file())
+                image_files = candidate["image_files"]
+                self.assertTrue(
+                    (Path(temporary_dir) / image_files["original"]).is_file()
+                )
+                self.assertTrue(
+                    (
+                        Path(temporary_dir) / image_files["kept_patch_overlay"]
+                    ).is_file()
+                )
+                word_maps = image_files["logit_lens_word_maps_by_layer"]
+                self.assertEqual(set(word_maps), {"7", "8"})
+                for layer_paths in word_maps.values():
+                    for relative_path in layer_paths.values():
+                        self.assertTrue(
+                            (Path(temporary_dir) / relative_path).is_file()
+                        )
 
     def test_consumer_splits_concatenated_layer_states_by_image(self):
         class FakePruner:

@@ -18,12 +18,24 @@ special tokens visible while still providing a human-readable form.
 from __future__ import annotations
 
 import colorsys
+import copy
 import json
 import random
 import re
+import shutil
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Callable, DefaultDict, Dict, List, Mapping, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -512,8 +524,119 @@ def select_eligible_query_subset(
     return selected, selection_metadata
 
 
+def select_all_eligible_queries(
+    first_stage_results: Mapping[Any, Mapping[str, Any]],
+) -> Tuple[Dict[Any, Mapping[str, Any]], Dict[str, Any]]:
+    """Return every query that can provide one GT and one non-GT candidate.
+
+    This separate full-coverage path leaves the existing seeded 20-query sampler
+    unchanged. It is intended for corpus-level aggregate statistics where early
+    stopping would make the reported POS frequencies describe only a sample.
+    """
+    selected: Dict[Any, Mapping[str, Any]] = {}
+    skipped: DefaultDict[str, int] = defaultdict(int)
+    for key, item in first_stage_results.items():
+        gt_page_ids = {int(page_id) for page_id in item.get("page_id", [])}
+        top_k_global_indices = list(item.get("top_k_global_indices", []))
+        if not gt_page_ids:
+            skipped["no_ground_truth_page"] += 1
+            continue
+        if not top_k_global_indices:
+            skipped["empty_first_stage_candidates"] += 1
+            continue
+
+        start_idx = int(item["start_idx"])
+        end_idx = int(item["end_idx"])
+        local_page_ids = [
+            int(global_idx) - start_idx for global_idx in top_k_global_indices
+        ]
+        if any(
+            not 0 <= page_id <= end_idx - start_idx
+            for page_id in local_page_ids
+        ):
+            skipped["candidate_outside_document_range"] += 1
+            continue
+        if not any(page_id in gt_page_ids for page_id in local_page_ids):
+            skipped["correct_candidate_missing_from_topk"] += 1
+            continue
+        if not any(page_id not in gt_page_ids for page_id in local_page_ids):
+            skipped["incorrect_candidate_missing_from_topk"] += 1
+            continue
+        selected[key] = item
+
+    if not selected:
+        raise ValueError(
+            "No query contains both a ground-truth and a non-ground-truth candidate"
+        )
+    selection_metadata = {
+        "selection_method": "complete scan; all eligible queries",
+        "selection_seed": None,
+        "total_first_stage_queries": len(first_stage_results),
+        "queries_inspected_before_early_stop": len(first_stage_results),
+        "queries_not_inspected": 0,
+        "eligible_queries_encountered": len(selected),
+        "selected_queries": len(selected),
+        "required_correct_candidates": 1,
+        "required_incorrect_candidates": 1,
+        "prefilter_skipped_queries": dict(sorted(skipped.items())),
+        "eligibility_rule": (
+            "First-stage Top-K must contain at least one ground-truth page and "
+            "at least one non-ground-truth page."
+        ),
+    }
+    return selected, selection_metadata
+
+
+def select_base_diagnostic_records(
+    query_records: Sequence[Mapping[str, Any]],
+    sampled_results: Mapping[Any, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Copy sampled records in seeded order and remove all-only extensions.
+
+    An all-eligible inference run produces records in dataset order, whereas the
+    established 20-query diagnostic uses seeded sampling order. Matching on the
+    stable ``(doc_name, q_idx)`` identity restores that original order. Deep
+    copies prevent image-path insertion and extension removal from mutating the
+    complete records written to the separate corpus-level JSON.
+    """
+    records_by_identity: Dict[Tuple[str, int], Mapping[str, Any]] = {}
+    for query_record in query_records:
+        identity = (
+            str(query_record["doc_name"]),
+            int(query_record["q_idx"]),
+        )
+        if identity in records_by_identity:
+            raise ValueError(f"Duplicate token-alignment query identity: {identity}")
+        records_by_identity[identity] = query_record
+
+    sampled_records = []
+    for sampled_result in sampled_results.values():
+        identity = (
+            str(sampled_result["doc_name"]),
+            int(sampled_result["q_idx"]),
+        )
+        if identity not in records_by_identity:
+            raise ValueError(
+                "Sampled query is missing from the all-eligible alignment results: "
+                f"{identity}"
+            )
+        sampled_record: Dict[str, Any] = copy.deepcopy(
+            dict(records_by_identity[identity])
+        )
+        sampled_record.pop(
+            "additional_incorrect_candidates_before_correct",
+            None,
+        )
+        sampled_record.pop(
+            "incorrect_candidates_before_correct_complete",
+            None,
+        )
+        sampled_records.append(sampled_record)
+    return sampled_records
+
+
 class TokenAlignmentCollector:
-    """Collect two candidates per query and serialize token-level alignments."""
+    """Collect the existing pair plus optional errors ranked before the GT."""
 
     def __init__(
         self,
@@ -521,6 +644,7 @@ class TokenAlignmentCollector:
         image_binary_loader: Callable[[int], bytes],
         spatial_merge_size: int,
         overlay_alpha: int = 72,
+        collect_incorrect_before_correct: bool = False,
     ) -> None:
         if spatial_merge_size <= 0:
             raise ValueError("spatial_merge_size must be positive")
@@ -530,6 +654,9 @@ class TokenAlignmentCollector:
         self.image_binary_loader = image_binary_loader
         self.spatial_merge_size = int(spatial_merge_size)
         self.overlay_alpha = int(overlay_alpha)
+        self.collect_incorrect_before_correct = bool(
+            collect_incorrect_before_correct
+        )
         self.query_records: List[Dict[str, Any]] = []
         self.total_queries_seen = 0
         self.skipped_counts: DefaultDict[str, int] = defaultdict(int)
@@ -874,7 +1001,7 @@ class TokenAlignmentCollector:
             ))
 
         top1_pos = ranked_indices[0]
-        self.query_records.append({
+        query_record = {
             "qid": result.get("qid", f"{result['doc_name']}_{result['q_idx']}"),
             "doc_name": result["doc_name"],
             "domain": result["domain"],
@@ -887,7 +1014,39 @@ class TokenAlignmentCollector:
             "num_qi_text_tokens": len(query_tokens),
             "qi_text_token_sequence": query_tokens,
             "candidates": candidates,
-        })
+        }
+
+        if self.collect_incorrect_before_correct:
+            # 原有 candidates 始终保持“最高正确 + 最高错误”两项。仅在显式开启
+            # 新统计时，把其余排在最高正确候选之前的错误候选写入独立扩展字段，
+            # 从而既能完整统计 Top1 错误组，又不会改变旧统计读取的候选集合。
+            highest_correct_rank = rank_by_position[correct_positions[0]]
+            highest_incorrect_pos = incorrect_positions[0]
+            additional_incorrect_positions = [
+                candidate_pos
+                for candidate_pos in incorrect_positions
+                if candidate_pos != highest_incorrect_pos
+                and rank_by_position[candidate_pos] < highest_correct_rank
+            ]
+            additional_incorrect_candidates = []
+            for candidate_pos in additional_incorrect_positions:
+                additional_incorrect_candidates.append(
+                    self._build_candidate_record(
+                        role="incorrect_ranked_before_correct",
+                        candidate_pos=candidate_pos,
+                        final_rank=rank_by_position[candidate_pos],
+                        global_idx=top_k_global_indices[candidate_pos],
+                        local_page_id=local_page_ids[candidate_pos],
+                        stats=stats_by_position[candidate_pos],
+                        query_tokens=query_tokens,
+                    )
+                )
+            query_record[
+                "additional_incorrect_candidates_before_correct"
+            ] = additional_incorrect_candidates
+            query_record["incorrect_candidates_before_correct_complete"] = True
+
+        self.query_records.append(query_record)
 
     @staticmethod
     def _safe_path_component(value: Any, fallback: str) -> str:
@@ -980,23 +1139,46 @@ class TokenAlignmentCollector:
         output_file: str,
         *,
         run_metadata: Mapping[str, Any],
+        query_records: Optional[Sequence[Dict[str, Any]]] = None,
+        write_images: bool = True,
+        total_queries_seen: Optional[int] = None,
+        reset_image_output_directory: bool = False,
     ) -> Path:
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        exported_records = (
+            self.query_records if query_records is None else list(query_records)
+        )
 
         # Keep all generated images beside the JSON in a deterministic sibling
         # directory. One query directory contains the selected GT and non-GT page,
         # and each candidate contains both the untouched source and its overlay.
         image_output_path = output_path.parent / f"{output_path.stem}_images"
-        for query_index, query_record in enumerate(self.query_records, start=1):
-            for candidate_record in query_record["candidates"]:
-                self._write_candidate_images(
-                    image_output_path=image_output_path,
-                    json_parent=output_path.parent,
-                    query_index=query_index,
-                    query_record=query_record,
-                    candidate_record=candidate_record,
-                )
+        if write_images:
+            if reset_image_output_directory and image_output_path.exists():
+                # The directory name is deterministically derived from this JSON
+                # and must be its direct sibling. Validate that boundary before
+                # removing stale query directories from an earlier all-query run.
+                resolved_parent = output_path.parent.resolve()
+                resolved_image_output = image_output_path.resolve()
+                if (
+                    resolved_image_output.parent != resolved_parent
+                    or resolved_image_output == resolved_parent
+                ):
+                    raise ValueError(
+                        "Refusing to reset an image directory outside the output "
+                        f"directory: {resolved_image_output}"
+                    )
+                shutil.rmtree(resolved_image_output)
+            for query_index, query_record in enumerate(exported_records, start=1):
+                for candidate_record in query_record["candidates"]:
+                    self._write_candidate_images(
+                        image_output_path=image_output_path,
+                        json_parent=output_path.parent,
+                        query_index=query_index,
+                        query_record=query_record,
+                        candidate_record=candidate_record,
+                    )
 
         # 顶层同时写入索引、字符串和并列 argmax 的解释，使 JSON 脱离代码后仍可
         # 独立理解；queries 中才是每个 query、候选和视觉 token 的实际诊断数据。
@@ -1058,10 +1240,14 @@ class TokenAlignmentCollector:
                 "image_path_base": "Directory containing this JSON file.",
             },
             "run": dict(run_metadata),
-            "total_queries_seen": self.total_queries_seen,
-            "num_queries_exported": len(self.query_records),
+            "total_queries_seen": (
+                self.total_queries_seen
+                if total_queries_seen is None
+                else int(total_queries_seen)
+            ),
+            "num_queries_exported": len(exported_records),
             "skipped_queries": dict(sorted(self.skipped_counts.items())),
-            "queries": self.query_records,
+            "queries": exported_records,
         }
         output_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),

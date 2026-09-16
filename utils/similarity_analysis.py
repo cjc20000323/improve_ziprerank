@@ -32,6 +32,10 @@ from .similarity_image_export import (
 )
 
 
+TOP1_OUTCOME_GROUPS = ("top1_correct", "top1_incorrect")
+OUTCOME_CANDIDATE_CLASSES = ("correct_candidates", "incorrect_candidates")
+
+
 def ensure_matplotlib_available() -> None:
     """在长时间评估开始前检查绘图库，并使用无界面的 Agg 后端。"""
     try:
@@ -108,6 +112,49 @@ class TokenSimilarityAnalysisCollector:
         }
         self._comparison_candidate_counts = {
             role: 0 for role in self._comparison_sums
+        }
+
+        # 新增的 Top1 结果分组与原有 comparison 累计器完全独立。标量指标按候选
+        # 等权累计；分布则先在单个 query 内对同类候选求平均，再跨 query 等权，
+        # 这样 Top1 错误且前置错误候选较多的 query 不会主导总体曲线。
+        self.outcome_group_query_counts = {
+            group: 0 for group in TOP1_OUTCOME_GROUPS
+        }
+        self.outcome_group_skipped_counts: DefaultDict[str, int] = defaultdict(int)
+        self._outcome_metric_sums = {
+            group: {
+                candidate_class: {
+                    "pruning_threshold_similarity": 0.0,
+                    "all_token_similarity": 0.0,
+                    "all_token_similarity_variance": 0.0,
+                    "entropy_shannon_bits": 0.0,
+                    "entropy_normalized": 0.0,
+                    "entropy_effective_bins": 0.0,
+                }
+                for candidate_class in OUTCOME_CANDIDATE_CLASSES
+            }
+            for group in TOP1_OUTCOME_GROUPS
+        }
+        self._outcome_candidate_counts = {
+            group: {
+                candidate_class: 0
+                for candidate_class in OUTCOME_CANDIDATE_CLASSES
+            }
+            for group in TOP1_OUTCOME_GROUPS
+        }
+        self._outcome_histogram_sums = {
+            group: {
+                candidate_class: np.zeros(num_bins, dtype=np.float64)
+                for candidate_class in OUTCOME_CANDIDATE_CLASSES
+            }
+            for group in TOP1_OUTCOME_GROUPS
+        }
+        self._outcome_histogram_squared_sums = {
+            group: {
+                candidate_class: np.zeros(num_bins, dtype=np.float64)
+                for candidate_class in OUTCOME_CANDIDATE_CLASSES
+            }
+            for group in TOP1_OUTCOME_GROUPS
         }
 
         # 两组使用独立随机数发生器：正确组抽到哪些 query，不受错误组数量影响。
@@ -200,6 +247,24 @@ class TokenSimilarityAnalysisCollector:
         negative_positions = [
             pos for pos in ranked_indices if local_page_ids[pos] not in gt_page_ids
         ]
+
+        # 新分组只要求 Top-K 中同时存在正确和错误候选，不受原有逐样例绘图所需
+        # “三个错误候选”条件限制，因此必须在后面的早退逻辑之前完成累计。
+        if not gt_positions:
+            self.outcome_group_skipped_counts[
+                "correct_candidate_missing_from_topk"
+            ] += 1
+        elif not negative_positions:
+            self.outcome_group_skipped_counts[
+                "incorrect_candidate_missing_from_topk"
+            ] += 1
+        else:
+            self._add_top1_outcome_query(
+                ranked_indices=ranked_indices,
+                gt_positions=gt_positions,
+                negative_positions=negative_positions,
+                stats_by_position=stats_by_position,
+            )
 
         # 全查询聚合只要求 Top-K 中同时存在至少一个 GT 和一个非 GT，因此应在
         # “逐样例画图需要三个负例”等限制之前更新，避免漏掉本可用于成对比较的 query。
@@ -423,6 +488,129 @@ class TokenSimilarityAnalysisCollector:
             "entropy": self._histogram_entropy(counts),
         }
 
+
+    def _add_top1_outcome_query(
+        self,
+        ranked_indices: Sequence[int],
+        gt_positions: Sequence[int],
+        negative_positions: Sequence[int],
+        stats_by_position: Mapping[int, Mapping[str, Any]],
+    ) -> None:
+        """Apply the requested candidate rule for one reranked query."""
+        top1_position = int(ranked_indices[0])
+        gt_position_set = {int(position) for position in gt_positions}
+        negative_position_set = {
+            int(position) for position in negative_positions
+        }
+
+        if top1_position in gt_position_set:
+            outcome_group = "top1_correct"
+            selected_correct_positions = [top1_position]
+            selected_incorrect_positions = [int(negative_positions[0])]
+        else:
+            outcome_group = "top1_incorrect"
+            highest_correct_position = int(gt_positions[0])
+            highest_correct_rank_index = list(ranked_indices).index(
+                highest_correct_position
+            )
+            selected_correct_positions = [highest_correct_position]
+            selected_incorrect_positions = [
+                int(position)
+                for position in ranked_indices[:highest_correct_rank_index]
+            ]
+            if (
+                not selected_incorrect_positions
+                or any(
+                    position not in negative_position_set
+                    for position in selected_incorrect_positions
+                )
+            ):
+                raise ValueError(
+                    "Candidates ahead of the highest-ranked GT must all be non-GT"
+                )
+
+        self._add_top1_outcome_candidate_sets(
+            outcome_group=outcome_group,
+            correct_stats=[
+                stats_by_position[position]
+                for position in selected_correct_positions
+            ],
+            incorrect_stats=[
+                stats_by_position[position]
+                for position in selected_incorrect_positions
+            ],
+        )
+
+    def _add_top1_outcome_candidate_sets(
+        self,
+        outcome_group: str,
+        correct_stats: Sequence[Mapping[str, Any]],
+        incorrect_stats: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Accumulate scalar metrics and one query-balanced histogram per class."""
+        if outcome_group not in TOP1_OUTCOME_GROUPS:
+            raise ValueError(f"Unknown Top1 outcome group: {outcome_group!r}")
+        stats_by_class = {
+            "correct_candidates": list(correct_stats),
+            "incorrect_candidates": list(incorrect_stats),
+        }
+        if any(not values for values in stats_by_class.values()):
+            raise ValueError(
+                "Top1 outcome statistics require both correct and incorrect candidates"
+            )
+
+        # Finish all validation and numerical extraction before touching any sum;
+        # a malformed candidate can therefore never leave a half-updated query.
+        values_by_class = {
+            candidate_class: [
+                self._candidate_comparison_values(stats)
+                for stats in candidate_stats
+            ]
+            for candidate_class, candidate_stats in stats_by_class.items()
+        }
+        query_histogram_by_class = {
+            candidate_class: np.mean(
+                np.stack([
+                    self._normalized_histogram(
+                        torch.as_tensor(stats["scores"])
+                        .detach()
+                        .float()
+                        .cpu()
+                        .contiguous()
+                    )
+                    for stats in candidate_stats
+                ], axis=0),
+                axis=0,
+            )
+            for candidate_class, candidate_stats in stats_by_class.items()
+        }
+
+        for candidate_class, candidate_values in values_by_class.items():
+            sums = self._outcome_metric_sums[outcome_group][candidate_class]
+            for values in candidate_values:
+                entropy = values["entropy"]
+                sums["pruning_threshold_similarity"] += values["threshold"]
+                sums["all_token_similarity"] += values["mean_similarity"]
+                sums["all_token_similarity_variance"] += values[
+                    "similarity_variance"
+                ]
+                sums["entropy_shannon_bits"] += entropy["shannon_bits"]
+                sums["entropy_normalized"] += entropy["normalized"]
+                sums["entropy_effective_bins"] += entropy["effective_bins"]
+            self._outcome_candidate_counts[outcome_group][candidate_class] += len(
+                candidate_values
+            )
+
+            query_histogram = query_histogram_by_class[candidate_class]
+            self._outcome_histogram_sums[outcome_group][
+                candidate_class
+            ] += query_histogram
+            self._outcome_histogram_squared_sums[outcome_group][
+                candidate_class
+            ] += np.square(query_histogram)
+
+        self.outcome_group_query_counts[outcome_group] += 1
+
     @staticmethod
     def _select_comparison_positions(
         ranked_positions: Sequence[int],
@@ -592,6 +780,173 @@ class TokenSimilarityAnalysisCollector:
             },
         }
 
+
+    def _top1_outcome_distribution_summary(
+        self,
+        outcome_group: str,
+        candidate_class: str,
+    ) -> Dict[str, Any]:
+        """Return the query-balanced mean density and its per-bin 95% CI."""
+        query_count = self.outcome_group_query_counts[outcome_group]
+        if query_count == 0:
+            return {
+                "num_query_histograms": 0,
+                "mean_density": None,
+                "ci95_lower": None,
+                "ci95_upper": None,
+            }
+
+        histogram_sum = self._outcome_histogram_sums[outcome_group][
+            candidate_class
+        ]
+        mean_density = histogram_sum / query_count
+        if query_count == 1:
+            ci = np.zeros_like(mean_density)
+        else:
+            squared_sum = self._outcome_histogram_squared_sums[outcome_group][
+                candidate_class
+            ]
+            centered_sum_squares = np.maximum(
+                squared_sum - np.square(histogram_sum) / query_count,
+                0.0,
+            )
+            sample_variance = centered_sum_squares / (query_count - 1)
+            ci = 1.96 * np.sqrt(sample_variance / query_count)
+
+        return {
+            "num_query_histograms": query_count,
+            "mean_density": mean_density.tolist(),
+            "ci95_lower": np.maximum(mean_density - ci, 0.0).tolist(),
+            "ci95_upper": (mean_density + ci).tolist(),
+        }
+
+    def _top1_outcome_similarity_summary(
+        self,
+        keep_ratio: float,
+    ) -> Dict[str, Any]:
+        """Summarize the additive Top1-conditioned candidate statistics."""
+        selection_rules = {
+            "top1_correct": {
+                "correct_candidates": "The final Top1 ground-truth candidate.",
+                "incorrect_candidates": (
+                    "The highest-ranked non-ground-truth candidate."
+                ),
+            },
+            "top1_incorrect": {
+                "correct_candidates": (
+                    "The highest-ranked ground-truth candidate."
+                ),
+                "incorrect_candidates": (
+                    "Every non-ground-truth candidate ranked ahead of the "
+                    "highest-ranked ground-truth candidate."
+                ),
+            },
+        }
+
+        def candidate_class_summary(
+            outcome_group: str,
+            candidate_class: str,
+        ) -> Dict[str, Any]:
+            query_count = self.outcome_group_query_counts[outcome_group]
+            candidate_count = self._outcome_candidate_counts[outcome_group][
+                candidate_class
+            ]
+            sums = self._outcome_metric_sums[outcome_group][candidate_class]
+            if candidate_count == 0:
+                mean_threshold = None
+                mean_similarity = None
+                mean_variance = None
+                mean_entropy = {
+                    "shannon_bits": None,
+                    "normalized": None,
+                    "effective_bins": None,
+                }
+            else:
+                mean_threshold = (
+                    sums["pruning_threshold_similarity"] / candidate_count
+                )
+                mean_similarity = sums["all_token_similarity"] / candidate_count
+                mean_variance = (
+                    sums["all_token_similarity_variance"] / candidate_count
+                )
+                mean_entropy = {
+                    "shannon_bits": (
+                        sums["entropy_shannon_bits"] / candidate_count
+                    ),
+                    "normalized": (
+                        sums["entropy_normalized"] / candidate_count
+                    ),
+                    "effective_bins": (
+                        sums["entropy_effective_bins"] / candidate_count
+                    ),
+                }
+            return {
+                "num_queries": query_count,
+                "num_candidates": candidate_count,
+                "mean_candidates_per_query": (
+                    candidate_count / query_count if query_count else None
+                ),
+                "mean_pruning_threshold_similarity": mean_threshold,
+                "mean_all_token_similarity": mean_similarity,
+                "mean_all_token_similarity_variance": mean_variance,
+                "mean_all_token_similarity_entropy": mean_entropy,
+                "token_similarity_distribution": (
+                    self._top1_outcome_distribution_summary(
+                        outcome_group,
+                        candidate_class,
+                    )
+                ),
+            }
+
+        return {
+            "keep_ratio": keep_ratio,
+            "total_queries_seen": self.total_queries,
+            "eligible_queries": dict(self.outcome_group_query_counts),
+            "skipped_queries": dict(
+                sorted(self.outcome_group_skipped_counts.items())
+            ),
+            "bin_edges": self.bin_edges.tolist(),
+            "candidate_metric_weighting": (
+                "Each selected candidate contributes equally to scalar means."
+            ),
+            "distribution_weighting": (
+                "Each candidate is converted to a normalized density. Candidates "
+                "of the same class are averaged within a query, then queries are "
+                "averaged equally."
+            ),
+            "variance_basis": {
+                "score_group": "all visual tokens before pruning",
+                "ddof": 0,
+                "aggregation": "Candidate population variances are averaged equally.",
+            },
+            "entropy_basis": {
+                "score_group": "all visual tokens before pruning",
+                "num_bins": self.num_bins,
+                "display_range": [
+                    float(self.bin_edges[0]),
+                    float(self.bin_edges[-1]),
+                ],
+                "out_of_range_rule": (
+                    "Values are clipped into the first or last bin."
+                ),
+            },
+            "groups": {
+                outcome_group: {
+                    "num_queries": self.outcome_group_query_counts[outcome_group],
+                    "selection_rule": selection_rules[outcome_group],
+                    "correct_candidates": candidate_class_summary(
+                        outcome_group,
+                        "correct_candidates",
+                    ),
+                    "incorrect_candidates": candidate_class_summary(
+                        outcome_group,
+                        "incorrect_candidates",
+                    ),
+                }
+                for outcome_group in TOP1_OUTCOME_GROUPS
+            },
+        }
+
     @staticmethod
     def _candidate_score_groups(
         candidate: Mapping[str, Any],
@@ -669,13 +1024,24 @@ class TokenSimilarityAnalysisCollector:
         comparison_path = output_path / (
             f"all_query_candidate_similarity_summary_keep{keep_percent}.json"
         )
+        outcome_summary_path = output_path / (
+            f"top1_outcome_token_similarity_summary_keep{keep_percent}.json"
+        )
         overall_path = output_path / f"overall_token_similarity_keep{keep_percent}.png"
+        outcome_figure_path = output_path / (
+            f"top1_outcome_token_similarity_keep{keep_percent}.png"
+        )
         correct_dir = output_path / f"recall1_correct_examples_keep{keep_percent}"
         incorrect_dir = output_path / f"recall1_incorrect_examples_keep{keep_percent}"
 
         comparison_summary = self._all_query_candidate_comparison_summary(keep_ratio)
         comparison_path.write_text(
             json.dumps(comparison_summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        outcome_summary = self._top1_outcome_similarity_summary(keep_ratio)
+        outcome_summary_path.write_text(
+            json.dumps(outcome_summary, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
 
@@ -722,6 +1088,11 @@ class TokenSimilarityAnalysisCollector:
         )
 
         self._plot_overall(overall_path, keep_ratio)
+        self._plot_top1_outcome(
+            outcome_figure_path,
+            keep_ratio,
+            outcome_summary,
+        )
         correct_figure_paths = self._plot_examples(
             self.correct_examples,
             correct_dir,
@@ -759,7 +1130,9 @@ class TokenSimilarityAnalysisCollector:
             "summary": str(summary_path),
             "histogram_counts": str(histogram_path),
             "all_query_candidate_summary": str(comparison_path),
+            "top1_outcome_summary": str(outcome_summary_path),
             "overall_figure": str(overall_path),
+            "top1_outcome_figure": str(outcome_figure_path),
             "correct_figure_directory": str(correct_dir),
             "incorrect_figure_directory": str(incorrect_dir),
         }
@@ -923,6 +1296,116 @@ class TokenSimilarityAnalysisCollector:
                 ],
             },
         }
+
+    def _plot_top1_outcome(
+        self,
+        output_path: Path,
+        keep_ratio: float,
+        summary: Mapping[str, Any],
+    ) -> None:
+        """Plot the two additive Top1-conditioned similarity distributions."""
+        plt = importlib.import_module("matplotlib.pyplot")
+        centers = (self.bin_edges[:-1] + self.bin_edges[1:]) / 2
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5.5), sharex=True, sharey=True)
+        class_styles = {
+            "correct_candidates": {
+                "label": "Selected correct candidate(s)",
+                "color": "#2ca02c",
+                "linestyle": "-",
+                "marker": "o",
+                "markevery": (0, 10),
+            },
+            "incorrect_candidates": {
+                "label": "Selected incorrect candidate(s)",
+                "color": "#d62728",
+                "linestyle": "--",
+                "marker": "s",
+                "markevery": (5, 10),
+            },
+        }
+        group_titles = {
+            "top1_correct": "Top1 correct",
+            "top1_incorrect": "Top1 incorrect",
+        }
+
+        for axis, outcome_group in zip(axes, TOP1_OUTCOME_GROUPS):
+            group_summary = summary["groups"][outcome_group]
+            plotted = False
+            for candidate_class in OUTCOME_CANDIDATE_CLASSES:
+                candidate_summary = group_summary[candidate_class]
+                distribution = candidate_summary[
+                    "token_similarity_distribution"
+                ]
+                mean_density = distribution["mean_density"]
+                if mean_density is None:
+                    continue
+
+                style = class_styles[candidate_class]
+                axis.plot(
+                    centers,
+                    mean_density,
+                    color=style["color"],
+                    linestyle=style["linestyle"],
+                    linewidth=2,
+                    marker=style["marker"],
+                    markevery=style["markevery"],
+                    markersize=4.5,
+                    markerfacecolor="white",
+                    markeredgewidth=1.2,
+                    label=style["label"],
+                )
+                axis.fill_between(
+                    centers,
+                    distribution["ci95_lower"],
+                    distribution["ci95_upper"],
+                    color=style["color"],
+                    alpha=0.14,
+                )
+                mean_threshold = candidate_summary[
+                    "mean_pruning_threshold_similarity"
+                ]
+                if mean_threshold is not None:
+                    axis.axvline(
+                        mean_threshold,
+                        color=style["color"],
+                        linestyle=":",
+                        linewidth=1.2,
+                        alpha=0.85,
+                        label=(
+                            f"{style['label']} mean threshold="
+                            f"{mean_threshold:.4f}"
+                        ),
+                    )
+                plotted = True
+
+            axis.set_title(
+                f"{group_titles[outcome_group]}\n"
+                f"Eligible queries: {group_summary['num_queries']}"
+            )
+            axis.set_xlim(float(self.bin_edges[0]), float(self.bin_edges[-1]))
+            axis.set_xlabel("Max cosine similarity per visual token")
+            axis.grid(alpha=0.2)
+            if plotted:
+                axis.legend(fontsize=8)
+            else:
+                axis.text(
+                    0.5,
+                    0.5,
+                    "No eligible queries",
+                    ha="center",
+                    va="center",
+                    transform=axis.transAxes,
+                )
+
+        axes[0].set_ylabel("Query-balanced density")
+        fig.suptitle(
+            f"Token similarity by reranking Top1 outcome (keep {keep_ratio:.0%})\n"
+            "Shaded region: query-level normal-approximation 95% CI",
+            fontsize=13,
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.90))
+        fig.savefig(output_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
 
     def _plot_overall(self, output_path: Path, keep_ratio: float) -> None:
         """绘制全部合格 query 的等权平均分布，而不是只统计抽中的 5 个样例。"""
