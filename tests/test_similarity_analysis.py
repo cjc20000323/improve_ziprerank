@@ -64,6 +64,63 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             ["top1_correct", "negative_1", "negative_2", "negative_3"],
         )
 
+    def test_zero_pruning_supports_an_empty_pruned_token_group(self):
+        collector = TokenSimilarityAnalysisCollector(num_examples=5, seed=7)
+        candidate_stats = self._candidate_stats()
+        for item in candidate_stats:
+            item["kept_mask"] = torch.ones(4, dtype=torch.bool)
+            item["threshold"] = float(item["scores"].min())
+            item["num_kept_tokens"] = 4
+
+        collector.add_query(
+            self._result(
+                ranked_indices=[2, 0, 1, 3, 4],
+                ground_truth_page_ids=[3],
+            ),
+            candidate_stats,
+        )
+
+        summary = collector._all_query_candidate_comparison_summary(
+            keep_ratio=1.0
+        )
+        metrics = summary["metrics"]["ground_truth_candidates"]
+        self.assertEqual(metrics["num_candidates_with_pruned_tokens"], 0)
+        self.assertIsNone(metrics["mean_pruned_token_similarity"])
+        self.assertIsNone(metrics["mean_pruned_token_similarity_variance"])
+        self.assertEqual(
+            metrics["mean_pruned_token_similarity_entropy"],
+            {
+                "shannon_bits": None,
+                "normalized": None,
+                "effective_bins": None,
+            },
+        )
+        self.assertEqual(metrics["num_candidates_with_kept_tokens"], 1)
+        self.assertAlmostEqual(
+            metrics["mean_all_token_similarity"],
+            metrics["mean_kept_token_similarity"],
+        )
+
+        example = collector.correct_examples[0]
+        exported = collector._candidate_histogram_export(
+            example["candidates"][0],
+            tuple(example["entropy_similarity_range"]),
+        )
+        pruned = exported["distributions"]["pruned"]
+        self.assertEqual(pruned["num_tokens"], 0)
+        self.assertEqual(sum(pruned["counts"]), 0)
+        self.assertTrue(all(value == 0.0 for value in pruned["density"]))
+        self.assertIsNone(pruned["mean"])
+        self.assertIsNone(pruned["variance"])
+        self.assertEqual(
+            pruned["entropy"],
+            {
+                "shannon_bits": None,
+                "normalized": None,
+                "effective_bins": None,
+            },
+        )
+
     def test_incorrect_example_uses_top1_two_negatives_and_best_gt(self):
         # Top1 为非 GT；应保留它、其后两个非 GT，以及最终排名最高的 GT(pos=2)。
         collector = TokenSimilarityAnalysisCollector(num_examples=5, seed=7)

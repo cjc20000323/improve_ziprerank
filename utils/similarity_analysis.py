@@ -167,6 +167,7 @@ class TokenSimilarityAnalysisCollector:
         sums = {"pruning_threshold_similarity": 0.0}
         for token_group in TOKEN_SCORE_GROUPS:
             sums.update({
+                f"{token_group}_candidate_count": 0.0,
                 f"{token_group}_token_similarity": 0.0,
                 f"{token_group}_token_similarity_variance": 0.0,
                 f"{token_group}_entropy_shannon_bits": 0.0,
@@ -441,7 +442,10 @@ class TokenSimilarityAnalysisCollector:
         counts, _ = np.histogram(values, bins=self.bin_edges)
         total = counts.sum()
         if total == 0:
-            raise ValueError("No token similarities fell inside display range [0.0, 0.25]")
+            # At 0% pruning every visual token is retained, so the pruned-token
+            # distribution is genuinely empty.  Represent it as an all-zero
+            # curve instead of aborting the otherwise valid pruning condition.
+            return counts, np.zeros(self.num_bins, dtype=np.float64)
         widths = np.diff(self.bin_edges)
         # 除以 token 总数和 bin 宽度后，曲线面积为 1；不同 token 数的图才可比较。
         density = counts.astype(np.float64) / (total * widths)
@@ -495,8 +499,10 @@ class TokenSimilarityAnalysisCollector:
             raise ValueError(f"Invalid query similarity range: {similarity_range}")
 
         values = scores.detach().float().cpu().contiguous().numpy()
-        if values.ndim != 1 or values.size == 0:
-            raise ValueError("Histogram entropy requires non-empty 1-D scores")
+        if values.ndim != 1:
+            raise ValueError("Histogram entropy requires 1-D scores")
+        if values.size == 0:
+            return np.zeros(self.num_bins, dtype=np.int64)
         if float(values.min()) < range_min or float(values.max()) > range_max:
             raise ValueError(
                 "Token similarity falls outside its query entropy range: "
@@ -518,11 +524,15 @@ class TokenSimilarityAnalysisCollector:
             raise ValueError("Query-range entropy histogram lost token scores")
         return counts
 
-    def _histogram_entropy(self, counts: np.ndarray) -> Dict[str, float]:
+    def _histogram_entropy(self, counts: np.ndarray) -> Dict[str, Optional[float]]:
         """基于逐 bin 概率计算 Shannon 熵及其便于比较的派生指标。"""
         total = int(counts.sum())
         if total <= 0:
-            raise ValueError("Histogram entropy requires at least one token")
+            return {
+                "shannon_bits": None,
+                "normalized": None,
+                "effective_bins": None,
+            }
 
         probabilities = counts[counts > 0].astype(np.float64) / total
         shannon_bits = float(-np.sum(probabilities * np.log2(probabilities)))
@@ -567,10 +577,6 @@ class TokenSimilarityAnalysisCollector:
             "pruned": scores[~kept_mask],
             "kept": scores[kept_mask],
         }
-        if score_groups["pruned"].numel() == 0 or score_groups["kept"].numel() == 0:
-            raise ValueError(
-                "Candidate comparison requires both pruned and kept visual tokens"
-            )
 
         threshold_value = stats["threshold"]
         if isinstance(threshold_value, torch.Tensor):
@@ -582,11 +588,24 @@ class TokenSimilarityAnalysisCollector:
 
         token_group_metrics = {}
         for token_group, group_scores in score_groups.items():
+            if group_scores.numel() == 0:
+                token_group_metrics[token_group] = {
+                    "num_tokens": 0,
+                    "mean_similarity": None,
+                    "similarity_variance": None,
+                    "entropy": {
+                        "shannon_bits": None,
+                        "normalized": None,
+                        "effective_bins": None,
+                    },
+                }
+                continue
             entropy_counts = self._entropy_histogram_counts(
                 group_scores,
                 entropy_similarity_range,
             )
             token_group_metrics[token_group] = {
+                "num_tokens": int(group_scores.numel()),
                 "mean_similarity": float(group_scores.mean().item()),
                 # 每张候选图中当前 token 组是本次诊断关心的完整总体，因此使用
                 # unbiased=False（ddof=0），单 token 分组也能得到定义良好的 0 方差。
@@ -610,7 +629,10 @@ class TokenSimilarityAnalysisCollector:
         sums["pruning_threshold_similarity"] += float(values["threshold"])
         for token_group in TOKEN_SCORE_GROUPS:
             metrics = values["token_groups"][token_group]
+            if int(metrics["num_tokens"]) == 0:
+                continue
             entropy = metrics["entropy"]
+            sums[f"{token_group}_candidate_count"] += 1.0
             sums[f"{token_group}_token_similarity"] += metrics[
                 "mean_similarity"
             ]
@@ -633,7 +655,14 @@ class TokenSimilarityAnalysisCollector:
         """Build parallel output fields for all/pruned/kept token groups."""
         output: Dict[str, Any] = {}
         for token_group in TOKEN_SCORE_GROUPS:
-            if candidate_count == 0:
+            token_group_candidate_count = int(
+                sums[f"{token_group}_candidate_count"]
+            )
+            if token_group_candidate_count > candidate_count:
+                raise RuntimeError(
+                    f"{token_group} metric count exceeds total candidate count"
+                )
+            if token_group_candidate_count == 0:
                 mean_similarity = None
                 mean_variance = None
                 mean_entropy = {
@@ -643,27 +672,31 @@ class TokenSimilarityAnalysisCollector:
                 }
             else:
                 mean_similarity = (
-                    sums[f"{token_group}_token_similarity"] / candidate_count
+                    sums[f"{token_group}_token_similarity"]
+                    / token_group_candidate_count
                 )
                 mean_variance = (
                     sums[f"{token_group}_token_similarity_variance"]
-                    / candidate_count
+                    / token_group_candidate_count
                 )
                 mean_entropy = {
                     "shannon_bits": (
                         sums[f"{token_group}_entropy_shannon_bits"]
-                        / candidate_count
+                        / token_group_candidate_count
                     ),
                     "normalized": (
                         sums[f"{token_group}_entropy_normalized"]
-                        / candidate_count
+                        / token_group_candidate_count
                     ),
                     "effective_bins": (
                         sums[f"{token_group}_entropy_effective_bins"]
-                        / candidate_count
+                        / token_group_candidate_count
                     ),
                 }
             output.update({
+                f"num_candidates_with_{token_group}_tokens": (
+                    token_group_candidate_count
+                ),
                 f"mean_{token_group}_token_similarity": mean_similarity,
                 f"mean_{token_group}_token_similarity_variance": mean_variance,
                 f"mean_{token_group}_token_similarity_entropy": mean_entropy,
@@ -904,6 +937,11 @@ class TokenSimilarityAnalysisCollector:
                     "configured keep ratio."
                 ),
             },
+            "empty_token_group_rule": (
+                "If a pruning condition produces no tokens in a group, its scalar "
+                "metrics are null, its histogram counts and densities are zero, "
+                "and it is excluded from that group's candidate-level average."
+            ),
             "variance_basis": {
                 "score_groups": list(TOKEN_SCORE_GROUPS),
                 "ddof": 0,
@@ -1072,6 +1110,11 @@ class TokenSimilarityAnalysisCollector:
                     "configured keep ratio."
                 ),
             },
+            "empty_token_group_rule": (
+                "If a pruning condition produces no tokens in a group, its scalar "
+                "metrics are null, its histogram counts and densities are zero, "
+                "and it is excluded from that group's candidate-level average."
+            ),
             "distribution_weighting": (
                 "Each candidate is converted to a normalized density. Candidates "
                 "of the same class are averaged within a query, then queries are "
@@ -1134,11 +1177,6 @@ class TokenSimilarityAnalysisCollector:
             "pruned": scores[~kept_mask],
             "kept": scores[kept_mask],
         }
-        if score_groups["pruned"].numel() == 0 or score_groups["kept"].numel() == 0:
-            raise ValueError(
-                f"Candidate {candidate['candidate_letter']} must contain both "
-                "pruned and kept visual tokens"
-            )
         return score_groups
 
     def _add_group_histograms(
@@ -1388,6 +1426,12 @@ class TokenSimilarityAnalysisCollector:
                 entropy_similarity_range,
             )
             raw_values = group_scores.numpy()
+            if raw_values.size == 0:
+                mean = None
+                variance = None
+            else:
+                mean = float(np.mean(raw_values))
+                variance = float(np.var(raw_values, ddof=0))
             distributions[group_name] = {
                 "num_tokens": int(group_scores.numel()),
                 # 绘图会把显示范围外的值夹到首尾 bin；单独记录数量便于识别这种情况。
@@ -1401,8 +1445,8 @@ class TokenSimilarityAnalysisCollector:
                 "density": density.tolist(),
                 # all、pruned、kept 都按各自包含的 token 计算均值和总体方差；
                 # 其中 all 与 candidate.similarity 中的同名统计量一致。
-                "mean": float(np.mean(raw_values)),
-                "variance": float(np.var(raw_values, ddof=0)),
+                "mean": mean,
+                "variance": variance,
                 "entropy": self._histogram_entropy(entropy_counts),
             }
         exported["distributions"] = distributions
@@ -1465,6 +1509,10 @@ class TokenSimilarityAnalysisCollector:
             "density_semantics": (
                 "counts / (num_tokens * bin_width); these are the y-values "
                 "drawn by the example figures."
+            ),
+            "empty_distribution_semantics": (
+                "A token group with zero tokens has all-zero counts and density, "
+                "with null mean, variance, and entropy values."
             ),
             "entropy_semantics": {
                 "shannon_bits": "-sum(p_i * log2(p_i)) over non-empty bins.",

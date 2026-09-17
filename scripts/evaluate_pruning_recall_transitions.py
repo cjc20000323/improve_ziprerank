@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Run three visual-token pruning conditions and compare Recall@1 changes.
+"""Run a 0%-90% pruning sweep and group Recall@1/3/5 query outcomes.
 
 This is a standalone entry point built on top of ``scripts.evaluate``.  It loads
-the model and MMDocIR inputs once, evaluates 10%, 50%, and 90% pruning with an
-identical query set, and saves both transition lists and the existing token
-similarity diagnostics for every condition.
+the model and MMDocIR inputs once, evaluates every 10% pruning condition from 0%
+through 90% with an identical query set, and saves each condition's correct and
+incorrect Recall@1/3/5 queries plus the existing token-similarity diagnostics.
 """
 
 from __future__ import annotations
@@ -29,8 +29,9 @@ from models.qwen3vl_with_qi_early import Qwen3VLWithQIEarly  # noqa: E402
 from scripts import evaluate as base_evaluate  # noqa: E402
 from utils.pruning_recall_analysis import (
     PRUNING_TO_KEEP_RATIO,
-    compare_pruning_recall1,
-    save_pruning_recall1_analysis,
+    RECALL_CUTOFFS,
+    analyze_pruning_recalls,
+    save_pruning_recall_analysis,
     write_jsonl,
 )  # noqa: E402
 from utils.similarity_analysis import (
@@ -43,8 +44,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     """Parse the independent pruning-sweep entry point arguments."""
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate page reranking at 10%, 50%, and 90% visual-token pruning, "
-            "compare Recall@1 transitions, and save token-similarity distributions."
+            "Evaluate page reranking from 0% through 90% visual-token pruning in "
+            "10% increments; group Recall@1/3/5 correct and incorrect queries; "
+            "and save token-similarity distributions."
         )
     )
     parser.add_argument("--model_path", type=str, required=True)
@@ -57,10 +59,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="outputs/pruning_recall1_analysis",
+        default="outputs/pruning_recall_analysis",
     )
 
-    # All three conditions pass the same sampling controls into evaluate_mmdocir.
+    # All ten conditions pass the same sampling controls into evaluate_mmdocir.
     # sample_size=0 evaluates every query; num_queries, when provided, deliberately
     # follows evaluate.py semantics and takes the first N instead.
     parser.add_argument("--num_queries", type=int, default=None)
@@ -264,7 +266,7 @@ def _run_pruning_condition(
 
 
 def run(args: argparse.Namespace) -> Dict[str, Any]:
-    """Execute the three-condition experiment and return its transition summary."""
+    """Execute the ten-condition sweep and return per-cutoff query groups."""
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -308,7 +310,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-        analysis = compare_pruning_recall1(results_by_pruning)
+        analysis = analyze_pruning_recalls(results_by_pruning)
         analysis["run_config"] = {
             "model_path": args.model_path,
             "first_stage_file": args.first_stage_file,
@@ -320,6 +322,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "stride": args.stride,
             "ranking_mode": "logits_single_token",
             "qi_early_temperature": args.qi_early_temperature,
+            "pruning_percentages": list(PRUNING_TO_KEEP_RATIO),
+            "keep_ratio_by_pruning_percent": {
+                str(pruning_percent): keep_ratio
+                for pruning_percent, keep_ratio in PRUNING_TO_KEEP_RATIO.items()
+            },
             "similarity_num_examples_per_recall1_group": (
                 args.similarity_num_examples
             ),
@@ -333,8 +340,8 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             ),
         }
         analysis["artifacts_by_condition"] = artifacts_by_condition
-        transition_paths = save_pruning_recall1_analysis(analysis, output_dir)
-        analysis["transition_artifacts"] = transition_paths
+        analysis_path = save_pruning_recall_analysis(analysis, output_dir)
+        analysis["analysis_artifact"] = analysis_path
     finally:
         # InferenceTimer registers forward hooks. Removing them is important when
         # this entry point is invoked repeatedly from the same Python process.
@@ -350,23 +357,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     """CLI main entry point."""
     args = parse_args(argv)
     analysis = run(args)
-    transitions = analysis["transitions"]
 
     print()
     print("=" * 80)
-    print("Recall@1 pruning-transition analysis completed")
+    print("Recall@1/3/5 pruning analysis completed")
     print("=" * 80)
     print(f"Aligned samples: {analysis['num_aligned_samples']}")
-    print(
-        "Prune50 wrong -> Prune10 correct: "
-        f"{transitions['prune50_wrong_prune10_correct']['count']}"
-    )
-    print(
-        "Prune50 correct -> Prune90 wrong: "
-        f"{transitions['prune50_correct_prune90_wrong']['count']}"
-    )
-    for name, path in analysis["transition_artifacts"].items():
-        print(f"{name}: {path}")
+    for condition_name, condition in analysis["conditions"].items():
+        metric_counts = []
+        for k in RECALL_CUTOFFS:
+            metric = condition["metrics"][f"recall_at_{k}"]
+            metric_counts.append(
+                f"R@{k} correct={metric['correct_count']} "
+                f"incorrect={metric['incorrect_count']}"
+            )
+        print(f"{condition_name}: " + "; ".join(metric_counts))
+    print(f"analysis: {analysis['analysis_artifact']}")
 
 
 if __name__ == "__main__":

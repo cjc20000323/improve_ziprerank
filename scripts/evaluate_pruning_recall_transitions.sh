@@ -8,11 +8,12 @@ PRUNING_RECALL_PYTHON_BIN="${PRUNING_RECALL_PYTHON_BIN:-python}"
 PRUNING_RECALL_MODEL_PATH="${PRUNING_RECALL_MODEL_PATH:-/root/autodl-fs/models/ziprerank_stage2/final}"
 PRUNING_RECALL_FIRST_STAGE_FILE="${PRUNING_RECALL_FIRST_STAGE_FILE:-/root/autodl-tmp/data/mmdocir/first_stage_page_top20_dse.pkl}"
 PRUNING_RECALL_PAGES_PARQUET="${PRUNING_RECALL_PAGES_PARQUET:-/root/autodl-tmp/MMDocIR/dataset/MMDocIR_pages.parquet}"
-PRUNING_RECALL_OUTPUT_DIR="${PRUNING_RECALL_OUTPUT_DIR:-/root/autodl-tmp/outputs/pruning_recall1_analysis}"
+PRUNING_RECALL_OUTPUT_DIR="${PRUNING_RECALL_OUTPUT_DIR:-/root/autodl-tmp/outputs/pruning_recall_analysis}"
 
-# sample_size=0 evaluates every query. All three pruning conditions reuse the
-# same seed and query-selection arguments, and the Python comparison fails fast
-# if their query sets or first-stage candidates do not match exactly.
+# sample_size=0 evaluates every query. All ten pruning conditions (0%-90% in
+# 10% increments) reuse the same seed and query-selection arguments, and the
+# Python comparison fails fast if their query sets or first-stage candidates do
+# not match exactly.
 PRUNING_RECALL_SAMPLE_SIZE="${PRUNING_RECALL_SAMPLE_SIZE:-0}"
 PRUNING_RECALL_SEED="${PRUNING_RECALL_SEED:-42}"
 PRUNING_RECALL_WINDOW_SIZE="${PRUNING_RECALL_WINDOW_SIZE:-20}"
