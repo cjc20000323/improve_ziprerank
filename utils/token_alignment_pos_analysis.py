@@ -5,6 +5,8 @@ alignment JSON. It never mutates that JSON and does not require another model
 forward. Query-token counts come from each selected candidate's
 ``matched_query_token_summary``; contextual part-of-speech labels come from a
 separately supplied tagger and are mapped back to the tokenizer subword spans.
+The final aggregate statistics and per-query diagnostics are returned as two
+separate payloads so callers can persist them independently.
 """
 
 from __future__ import annotations
@@ -428,8 +430,8 @@ def analyze_token_alignment_pos(
     top_k: int = 5,
     count_scope: str = "all",
     expected_num_queries: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Analyze every query record without changing the source alignment payload."""
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return separate aggregate and per-query POS reports."""
     if top_k <= 0:
         raise ValueError(f"top_k must be positive, got {top_k}")
     if count_scope not in COUNT_FIELDS:
@@ -437,7 +439,14 @@ def analyze_token_alignment_pos(
             f"count_scope must be one of {sorted(COUNT_FIELDS)}, got {count_scope!r}"
         )
 
-    source_queries = list(alignment_payload.get("queries", []))
+    if "queries" not in alignment_payload:
+        raise ValueError(
+            "Input token-alignment JSON has no top-level 'queries' field. "
+            "Use the per-query alignment JSON, not an aggregate statistics file."
+        )
+    if not isinstance(alignment_payload["queries"], list):
+        raise ValueError("Input token-alignment JSON field 'queries' must be a list")
+    source_queries = list(alignment_payload["queries"])
     declared_queries = int(alignment_payload.get("num_queries_exported", len(source_queries)))
     if declared_queries != len(source_queries):
         raise ValueError(
@@ -626,33 +635,38 @@ def analyze_token_alignment_pos(
         }
         outcome_statistics[group] = group_statistics
 
-    return {
-        "schema_version": 1,
+    source_alignment = {
+        "schema_version": alignment_payload.get("schema_version"),
+        "num_queries_exported": declared_queries,
+        "run": alignment_payload.get("run", {}),
+    }
+    configuration = {
+        "top_k_query_tokens_per_candidate": top_k,
+        "count_scope": count_scope,
+        "ranking_count_field": COUNT_FIELDS[count_scope],
+        "exclude_zero_count_tokens": True,
+        "exclude_special_tokens_from_top_k": True,
+        "candidate_roles": list(ANALYZED_ROLES),
+        "subword_pos_semantics": (
+            "Each model query token receives the contextual POS of the tagged "
+            "word span with which it has the largest character overlap. "
+            "Different subwords of one word can therefore contribute multiple "
+            "Top-K occurrences of the same POS."
+        ),
+    }
+    pos_tagger_metadata = dict(pos_tagger.metadata)
+    aggregate_report = {
+        "schema_version": 2,
+        "report_type": "aggregate_statistics",
         "description": (
             "Part-of-speech distribution among the query tokens attracting the "
             "largest numbers of visual tokens in the highest-ranked correct and "
-            "highest-ranked incorrect candidate for every input query."
+            "highest-ranked incorrect candidate for every input query. Per-query "
+            "results are stored in a separate JSON file."
         ),
-        "source_alignment": {
-            "schema_version": alignment_payload.get("schema_version"),
-            "num_queries_exported": declared_queries,
-            "run": alignment_payload.get("run", {}),
-        },
-        "configuration": {
-            "top_k_query_tokens_per_candidate": top_k,
-            "count_scope": count_scope,
-            "ranking_count_field": COUNT_FIELDS[count_scope],
-            "exclude_zero_count_tokens": True,
-            "exclude_special_tokens_from_top_k": True,
-            "candidate_roles": list(ANALYZED_ROLES),
-            "subword_pos_semantics": (
-                "Each model query token receives the contextual POS of the tagged "
-                "word span with which it has the largest character overlap. "
-                "Different subwords of one word can therefore contribute multiple "
-                "Top-K occurrences of the same POS."
-            ),
-        },
-        "pos_tagger": dict(pos_tagger.metadata),
+        "source_alignment": source_alignment,
+        "configuration": configuration,
+        "pos_tagger": pos_tagger_metadata,
         "coverage": {
             "queries_in_input": declared_queries,
             "queries_analyzed": num_queries,
@@ -667,5 +681,18 @@ def analyze_token_alignment_pos(
             "correct_and_incorrect_combined": combined_statistics,
         },
         "aggregate_by_top1_outcome": outcome_statistics,
+    }
+    query_report = {
+        "schema_version": 2,
+        "report_type": "per_query_results",
+        "description": (
+            "Per-query Top-K token-alignment and POS results. Totals, means, "
+            "fractions, and other aggregate statistics are stored separately."
+        ),
+        "source_alignment": source_alignment,
+        "configuration": configuration,
+        "pos_tagger": pos_tagger_metadata,
+        "num_queries": num_queries,
         "queries": output_queries,
     }
+    return aggregate_report, query_report

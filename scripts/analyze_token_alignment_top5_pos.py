@@ -1,4 +1,4 @@
-"""Create an independent Top-K query-token POS report from alignment JSON."""
+"""Create separate aggregate and per-query Top-K POS reports."""
 
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Count visual-token alignments for every query token, retain the "
-            "Top-K tokens per GT/best-wrong candidate, and aggregate their POS."
+            "Top-K tokens per GT/best-wrong candidate, and save aggregate POS "
+            "statistics separately from per-query results."
         )
     )
     parser.add_argument(
@@ -34,8 +35,16 @@ def parse_args() -> argparse.Namespace:
         "--output_file",
         default=None,
         help=(
-            "New statistics JSON. Defaults to <input_stem>_top5_pos.json beside "
-            "the input file. The input file is never overwritten."
+            "Aggregate statistics JSON. Defaults to <input_stem>_top5_pos.json "
+            "beside the input file. The input file is never overwritten."
+        ),
+    )
+    parser.add_argument(
+        "--query_output_file",
+        default=None,
+        help=(
+            "Per-query results JSON. Defaults to <output_stem>_queries.json "
+            "beside --output_file."
         ),
     )
     parser.add_argument(
@@ -78,12 +87,27 @@ def main() -> None:
         if args.output_file
         else input_path.with_name(f"{input_path.stem}_top5_pos.json")
     )
-    if input_path.resolve() == output_path.resolve():
-        raise ValueError("--output_file must differ from --input_file")
+    query_output_path = (
+        Path(args.query_output_file)
+        if args.query_output_file
+        else output_path.with_name(
+            f"{output_path.stem}_queries{output_path.suffix}"
+        )
+    )
+    resolved_paths = {
+        input_path.resolve(),
+        output_path.resolve(),
+        query_output_path.resolve(),
+    }
+    if len(resolved_paths) != 3:
+        raise ValueError(
+            "--input_file, --output_file, and --query_output_file must be "
+            "three different paths"
+        )
 
     alignment_payload = json.loads(input_path.read_text(encoding="utf-8"))
     pos_tagger = SpacyPosTagger(args.spacy_model)
-    report = analyze_token_alignment_pos(
+    aggregate_report, query_report = analyze_token_alignment_pos(
         alignment_payload,
         pos_tagger,
         top_k=args.top_k,
@@ -92,14 +116,20 @@ def main() -> None:
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    query_output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2),
+        json.dumps(aggregate_report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    query_output_path.write_text(
+        json.dumps(query_report, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(json.dumps({
         "input_file_unchanged": str(input_path),
-        "output_file": str(output_path),
-        "queries_analyzed": report["coverage"]["queries_analyzed"],
+        "aggregate_output_file": str(output_path),
+        "query_output_file": str(query_output_path),
+        "queries_analyzed": aggregate_report["coverage"]["queries_analyzed"],
         "top_k": args.top_k,
         "count_scope": args.count_scope,
         "spacy_model": args.spacy_model,

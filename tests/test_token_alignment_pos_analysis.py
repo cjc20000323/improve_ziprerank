@@ -1,7 +1,15 @@
 import copy
+import io
+import json
+import sys
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
 from typing import Any, Dict, Mapping, Sequence
+from unittest.mock import patch
 
+import scripts.analyze_token_alignment_top5_pos as token_alignment_pos_cli
 from utils.token_alignment_pos_analysis import (
     ContextualPosTagger,
     analyze_token_alignment_pos,
@@ -145,7 +153,7 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
         payload = self._payload()
         original_payload = copy.deepcopy(payload)
 
-        report = analyze_token_alignment_pos(
+        aggregate_report, query_report = analyze_token_alignment_pos(
             payload,
             _FakePosTagger(),
             top_k=5,
@@ -154,7 +162,17 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
         )
 
         self.assertEqual(payload, original_payload)
-        query_output = report["queries"][0]
+        self.assertEqual(aggregate_report["schema_version"], 2)
+        self.assertEqual(
+            aggregate_report["report_type"],
+            "aggregate_statistics",
+        )
+        self.assertNotIn("queries", aggregate_report)
+        self.assertEqual(query_report["report_type"], "per_query_results")
+        self.assertNotIn("aggregate", query_report)
+        self.assertNotIn("aggregate_by_top1_outcome", query_report)
+        self.assertEqual(query_report["num_queries"], 1)
+        query_output = query_report["queries"][0]
         correct, incorrect = query_output["candidates"]
         self.assertEqual(
             [row["query_sequence_index"] for row in correct["top_query_tokens"]],
@@ -169,7 +187,7 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
             [0, 4, 2, 3, 1],
         )
 
-        correct_stats = report["aggregate"]["by_candidate_role"][
+        correct_stats = aggregate_report["aggregate"]["by_candidate_role"][
             "highest_ranked_correct"
         ]
         correct_pos_counts = {
@@ -180,7 +198,9 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
         self.assertEqual(correct_pos_counts["ADJ"], 1)
         self.assertEqual(correct_stats["observed_top_k_slots"], 5)
 
-        combined_stats = report["aggregate"]["correct_and_incorrect_combined"]
+        combined_stats = aggregate_report["aggregate"][
+            "correct_and_incorrect_combined"
+        ]
         combined_pos_counts = {
             row["pos"]: row["total_top_k_occurrences"]
             for row in combined_stats["pos_statistics"]
@@ -194,20 +214,20 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
         self.assertEqual(noun_row["mean_occurrences_per_candidate"], 2.0)
 
     def test_kept_scope_ranks_by_kept_alignment_count(self):
-        report = analyze_token_alignment_pos(
+        aggregate_report, query_report = analyze_token_alignment_pos(
             self._payload(),
             _FakePosTagger(),
             top_k=3,
             count_scope="kept",
         )
 
-        correct = report["queries"][0]["candidates"][0]
+        correct = query_report["queries"][0]["candidates"][0]
         self.assertEqual(
             [row["query_sequence_index"] for row in correct["top_query_tokens"]],
             [1, 2, 3],
         )
         self.assertEqual(
-            report["configuration"]["ranking_count_field"],
+            aggregate_report["configuration"]["ranking_count_field"],
             "matched_kept_visual_token_count",
         )
 
@@ -254,7 +274,7 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
         payload["queries"].append(top1_correct_query)
         payload["num_queries_exported"] = 2
 
-        report = analyze_token_alignment_pos(
+        aggregate_report, query_report = analyze_token_alignment_pos(
             payload,
             _FakePosTagger(),
             top_k=5,
@@ -264,17 +284,21 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
         # The original aggregate remains one correct and one highest incorrect
         # candidate per query; the additional rank-2 error only enters the new group.
         self.assertEqual(
-            report["aggregate"]["correct_and_incorrect_combined"][
+            aggregate_report["aggregate"]["correct_and_incorrect_combined"][
                 "num_candidates"
             ],
             4,
         )
-        top1_correct = report["aggregate_by_top1_outcome"]["top1_correct"]
+        top1_correct = aggregate_report["aggregate_by_top1_outcome"][
+            "top1_correct"
+        ]
         self.assertEqual(top1_correct["num_queries"], 1)
         self.assertEqual(top1_correct["correct_candidates"]["num_candidates"], 1)
         self.assertEqual(top1_correct["incorrect_candidates"]["num_candidates"], 1)
 
-        top1_incorrect = report["aggregate_by_top1_outcome"]["top1_incorrect"]
+        top1_incorrect = aggregate_report["aggregate_by_top1_outcome"][
+            "top1_incorrect"
+        ]
         self.assertEqual(top1_incorrect["num_queries"], 1)
         self.assertEqual(top1_incorrect["correct_candidates"]["num_candidates"], 1)
         self.assertEqual(top1_incorrect["incorrect_candidates"]["num_candidates"], 2)
@@ -289,12 +313,56 @@ class TokenAlignmentPosAnalysisTest(unittest.TestCase):
         self.assertEqual(
             [
                 candidate["final_rank"]
-                for candidate in report["queries"][0][
+                for candidate in query_report["queries"][0][
                     "outcome_group_candidate_selection"
                 ]["incorrect_candidates"]
             ],
             [1, 2],
         )
+
+    def test_rejects_aggregate_report_as_alignment_input(self):
+        with self.assertRaisesRegex(ValueError, "per-query alignment JSON"):
+            analyze_token_alignment_pos(
+                {
+                    "schema_version": 2,
+                    "report_type": "aggregate_statistics",
+                    "aggregate": {},
+                },
+                _FakePosTagger(),
+            )
+
+    def test_cli_writes_aggregate_and_query_results_to_separate_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "alignment.json"
+            aggregate_path = Path(temp_dir) / "top5_pos.json"
+            query_path = Path(temp_dir) / "top5_pos_queries.json"
+            input_path.write_text(
+                json.dumps(self._payload()),
+                encoding="utf-8",
+            )
+            argv = [
+                "analyze_token_alignment_top5_pos.py",
+                "--input_file",
+                str(input_path),
+                "--output_file",
+                str(aggregate_path),
+            ]
+
+            with patch.object(sys, "argv", argv):
+                with patch(
+                    "scripts.analyze_token_alignment_top5_pos.SpacyPosTagger",
+                    lambda _model_name: _FakePosTagger(),
+                ), redirect_stdout(io.StringIO()):
+                    token_alignment_pos_cli.main()
+
+            aggregate_payload = json.loads(
+                aggregate_path.read_text(encoding="utf-8")
+            )
+            query_payload = json.loads(query_path.read_text(encoding="utf-8"))
+            self.assertNotIn("queries", aggregate_payload)
+            self.assertIn("aggregate", aggregate_payload)
+            self.assertNotIn("aggregate", query_payload)
+            self.assertEqual(len(query_payload["queries"]), 1)
 
     def test_outcome_group_rejects_missing_errors_before_correct(self):
         payload = self._payload()

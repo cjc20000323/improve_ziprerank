@@ -10,7 +10,8 @@ set -euo pipefail
 
 # Run the independent POS post-processing step on an existing token-alignment
 # JSON file. This script does not run model inference and never rewrites the
-# input JSON; the statistics are always saved to a separate output file.
+# input JSON. Aggregate statistics and per-query POS results are written to two
+# separate output files; neither output rewrites the alignment input.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname -- "${SCRIPT_DIR}")"
 
@@ -19,6 +20,7 @@ PROJECT_ROOT="$(dirname -- "${SCRIPT_DIR}")"
 TOKEN_ALIGNMENT_POS_PYTHON_BIN="${TOKEN_ALIGNMENT_POS_PYTHON_BIN:-python}"
 TOKEN_ALIGNMENT_POS_INPUT_FILE="${TOKEN_ALIGNMENT_POS_INPUT_FILE:-/root/autodl-tmp/outputs/token_alignment_analysis/token_alignment_20_queries_all_eligible.json}"
 TOKEN_ALIGNMENT_POS_OUTPUT_FILE="${TOKEN_ALIGNMENT_POS_OUTPUT_FILE:-${TOKEN_ALIGNMENT_POS_INPUT_FILE%.*}_top5_pos.json}"
+TOKEN_ALIGNMENT_POS_QUERY_OUTPUT_FILE="${TOKEN_ALIGNMENT_POS_QUERY_OUTPUT_FILE:-${TOKEN_ALIGNMENT_POS_OUTPUT_FILE%.*}_queries.json}"
 TOKEN_ALIGNMENT_POS_SPACY_MODEL="${TOKEN_ALIGNMENT_POS_SPACY_MODEL:-en_core_web_sm}"
 
 # By default, rank query tokens using the number of all aligned visual tokens.
@@ -35,6 +37,7 @@ TOKEN_ALIGNMENT_POS_EXPECTED_NUM_QUERIES="${TOKEN_ALIGNMENT_POS_EXPECTED_NUM_QUE
 pos_args=(
   --input_file "${TOKEN_ALIGNMENT_POS_INPUT_FILE}"
   --output_file "${TOKEN_ALIGNMENT_POS_OUTPUT_FILE}"
+  --query_output_file "${TOKEN_ALIGNMENT_POS_QUERY_OUTPUT_FILE}"
   --spacy_model "${TOKEN_ALIGNMENT_POS_SPACY_MODEL}"
   --top_k "${TOKEN_ALIGNMENT_POS_TOP_K}"
   --count_scope "${TOKEN_ALIGNMENT_POS_COUNT_SCOPE}"
