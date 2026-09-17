@@ -3,8 +3,8 @@
 这里同时维护两类数据：
 
 1. 整体分布：每张候选图先转换成归一化直方图，同一 query 中重复的负例角色
-   再取平均，最后跨 query 求均值。这样每个 query 的权重相同，不会让高分辨率、
-   token 更多的图像主导整体曲线。
+   再取平均，最后跨 query 求均值，并绘制各 bin 在 query 样例间的最小—最大包络。
+   这样每个 query 的权重相同，不会让高分辨率、token 更多的图像主导整体曲线。
 2. 典型样例：Recall@1 正确和错误两组各用 reservoir sampling 均匀抽取固定数量
    的 query，并保留其原始 token 分数，用于绘制逐样例曲线。
 
@@ -34,6 +34,7 @@ from .similarity_image_export import (
 
 TOP1_OUTCOME_GROUPS = ("top1_correct", "top1_incorrect")
 OUTCOME_CANDIDATE_CLASSES = ("correct_candidates", "incorrect_candidates")
+TOKEN_SCORE_GROUPS = ("all", "pruned", "kept")
 
 
 def ensure_matplotlib_available() -> None:
@@ -100,14 +101,7 @@ class TokenSimilarityAnalysisCollector:
         self.comparison_eligible_queries = 0
         self.comparison_skipped_counts: DefaultDict[str, int] = defaultdict(int)
         self._comparison_sums: Dict[str, Dict[str, float]] = {
-            role: {
-                "pruning_threshold_similarity": 0.0,
-                "all_token_similarity": 0.0,
-                "all_token_similarity_variance": 0.0,
-                "entropy_shannon_bits": 0.0,
-                "entropy_normalized": 0.0,
-                "entropy_effective_bins": 0.0,
-            }
+            role: self._new_candidate_metric_sums()
             for role in ("ground_truth_candidates", "top_ranked_incorrect_candidates")
         }
         self._comparison_candidate_counts = {
@@ -123,14 +117,7 @@ class TokenSimilarityAnalysisCollector:
         self.outcome_group_skipped_counts: DefaultDict[str, int] = defaultdict(int)
         self._outcome_metric_sums = {
             group: {
-                candidate_class: {
-                    "pruning_threshold_similarity": 0.0,
-                    "all_token_similarity": 0.0,
-                    "all_token_similarity_variance": 0.0,
-                    "entropy_shannon_bits": 0.0,
-                    "entropy_normalized": 0.0,
-                    "entropy_effective_bins": 0.0,
-                }
+                candidate_class: self._new_candidate_metric_sums()
                 for candidate_class in OUTCOME_CANDIDATE_CLASSES
             }
             for group in TOP1_OUTCOME_GROUPS
@@ -149,9 +136,16 @@ class TokenSimilarityAnalysisCollector:
             }
             for group in TOP1_OUTCOME_GROUPS
         }
-        self._outcome_histogram_squared_sums = {
+        self._outcome_histogram_mins = {
             group: {
-                candidate_class: np.zeros(num_bins, dtype=np.float64)
+                candidate_class: np.full(num_bins, np.inf, dtype=np.float64)
+                for candidate_class in OUTCOME_CANDIDATE_CLASSES
+            }
+            for group in TOP1_OUTCOME_GROUPS
+        }
+        self._outcome_histogram_maxs = {
+            group: {
+                candidate_class: np.full(num_bins, -np.inf, dtype=np.float64)
                 for candidate_class in OUTCOME_CANDIDATE_CLASSES
             }
             for group in TOP1_OUTCOME_GROUPS
@@ -166,6 +160,20 @@ class TokenSimilarityAnalysisCollector:
             "correct": defaultdict(list),
             "incorrect": defaultdict(list),
         }
+
+    @staticmethod
+    def _new_candidate_metric_sums() -> Dict[str, float]:
+        """Create independent accumulators for all/pruned/kept token metrics."""
+        sums = {"pruning_threshold_similarity": 0.0}
+        for token_group in TOKEN_SCORE_GROUPS:
+            sums.update({
+                f"{token_group}_token_similarity": 0.0,
+                f"{token_group}_token_similarity_variance": 0.0,
+                f"{token_group}_entropy_shannon_bits": 0.0,
+                f"{token_group}_entropy_normalized": 0.0,
+                f"{token_group}_entropy_effective_bins": 0.0,
+            })
+        return sums
 
     def add_query(
         self,
@@ -213,6 +221,7 @@ class TokenSimilarityAnalysisCollector:
                 "Similarity statistics do not cover every original candidate position "
                 f"for {result.get('qid', '<unknown>')}"
             )
+        entropy_similarity_range = self._query_similarity_range(candidate_stats)
 
         start_idx = int(result["start_idx"])
         end_idx = int(result["end_idx"])
@@ -264,6 +273,7 @@ class TokenSimilarityAnalysisCollector:
                 gt_positions=gt_positions,
                 negative_positions=negative_positions,
                 stats_by_position=stats_by_position,
+                entropy_similarity_range=entropy_similarity_range,
             )
 
         # 全查询聚合只要求 Top-K 中同时存在至少一个 GT 和一个非 GT，因此应在
@@ -292,6 +302,7 @@ class TokenSimilarityAnalysisCollector:
                 ground_truth_stats=[
                     stats_by_position[position] for position in selected_gt_positions
                 ],
+                entropy_similarity_range=entropy_similarity_range,
             )
 
         top1_pos = ranked_indices[0]
@@ -362,6 +373,7 @@ class TokenSimilarityAnalysisCollector:
             "ground_truth_page_ids": sorted(gt_page_ids),
             "recall_at_1": 1.0 / len(gt_page_ids) if recall1_correct else 0.0,
             "recall1_correct": recall1_correct,
+            "entropy_similarity_range": list(entropy_similarity_range),
             "candidates": candidates,
         }
 
@@ -440,6 +452,72 @@ class TokenSimilarityAnalysisCollector:
         _, density = self._histogram_counts_and_density(scores)
         return density
 
+    @staticmethod
+    def _query_similarity_range(
+        candidate_stats: Sequence[Mapping[str, Any]],
+    ) -> tuple[float, float]:
+        """Return the raw min/max over every candidate token in one query."""
+        query_min = math.inf
+        query_max = -math.inf
+        for stats in candidate_stats:
+            scores = (
+                torch.as_tensor(stats["scores"])
+                .detach()
+                .float()
+                .cpu()
+                .contiguous()
+            )
+            if scores.ndim != 1 or scores.numel() == 0:
+                raise ValueError(
+                    "Query entropy range requires non-empty 1-D candidate scores"
+                )
+            if not torch.isfinite(scores).all():
+                raise ValueError("Non-finite token similarity score encountered")
+            query_min = min(query_min, float(scores.min().item()))
+            query_max = max(query_max, float(scores.max().item()))
+
+        if not math.isfinite(query_min) or not math.isfinite(query_max):
+            raise ValueError("Query entropy range requires at least one candidate")
+        return query_min, query_max
+
+    def _entropy_histogram_counts(
+        self,
+        scores: torch.Tensor,
+        similarity_range: tuple[float, float],
+    ) -> np.ndarray:
+        """Bin raw scores over their query's shared min/max interval."""
+        range_min, range_max = similarity_range
+        if (
+            not math.isfinite(range_min)
+            or not math.isfinite(range_max)
+            or range_min > range_max
+        ):
+            raise ValueError(f"Invalid query similarity range: {similarity_range}")
+
+        values = scores.detach().float().cpu().contiguous().numpy()
+        if values.ndim != 1 or values.size == 0:
+            raise ValueError("Histogram entropy requires non-empty 1-D scores")
+        if float(values.min()) < range_min or float(values.max()) > range_max:
+            raise ValueError(
+                "Token similarity falls outside its query entropy range: "
+                f"scores=[{float(values.min())}, {float(values.max())}], "
+                f"range={similarity_range}"
+            )
+
+        if range_min == range_max:
+            counts = np.zeros(self.num_bins, dtype=np.int64)
+            counts[0] = values.size
+            return counts
+
+        counts, _ = np.histogram(
+            values,
+            bins=self.num_bins,
+            range=(range_min, range_max),
+        )
+        if int(counts.sum()) != values.size:
+            raise ValueError("Query-range entropy histogram lost token scores")
+        return counts
+
     def _histogram_entropy(self, counts: np.ndarray) -> Dict[str, float]:
         """基于逐 bin 概率计算 Shannon 熵及其便于比较的派生指标。"""
         total = int(counts.sum())
@@ -462,13 +540,37 @@ class TokenSimilarityAnalysisCollector:
     def _candidate_comparison_values(
         self,
         stats: Mapping[str, Any],
+        entropy_similarity_range: tuple[float, float],
     ) -> Dict[str, Any]:
-        """提取一个候选的剪枝阈值和剪枝前全部 token 的分布熵。"""
+        """提取一个候选在全部、剪掉和保留 token 上的三类指标。"""
         scores = torch.as_tensor(stats["scores"]).detach().float().cpu().contiguous()
-        if scores.ndim != 1 or scores.numel() == 0:
-            raise ValueError("Candidate comparison requires non-empty 1-D scores")
+        kept_mask = (
+            torch.as_tensor(stats["kept_mask"])
+            .detach()
+            .to(dtype=torch.bool, device="cpu")
+            .contiguous()
+        )
+        if scores.ndim != 1 or kept_mask.ndim != 1 or scores.numel() == 0:
+            raise ValueError(
+                "Candidate comparison requires non-empty 1-D scores and kept_mask"
+            )
+        if scores.numel() != kept_mask.numel():
+            raise ValueError(
+                "Candidate comparison similarity/mask length mismatch: "
+                f"{scores.numel()} vs {kept_mask.numel()}"
+            )
         if not torch.isfinite(scores).all():
             raise ValueError("Non-finite token similarity score encountered")
+
+        score_groups = {
+            "all": scores,
+            "pruned": scores[~kept_mask],
+            "kept": scores[kept_mask],
+        }
+        if score_groups["pruned"].numel() == 0 or score_groups["kept"].numel() == 0:
+            raise ValueError(
+                "Candidate comparison requires both pruned and kept visual tokens"
+            )
 
         threshold_value = stats["threshold"]
         if isinstance(threshold_value, torch.Tensor):
@@ -478,15 +580,95 @@ class TokenSimilarityAnalysisCollector:
         if not math.isfinite(threshold):
             raise ValueError("Non-finite pruning threshold encountered")
 
-        counts, _ = self._histogram_counts_and_density(scores)
+        token_group_metrics = {}
+        for token_group, group_scores in score_groups.items():
+            entropy_counts = self._entropy_histogram_counts(
+                group_scores,
+                entropy_similarity_range,
+            )
+            token_group_metrics[token_group] = {
+                "mean_similarity": float(group_scores.mean().item()),
+                # 每张候选图中当前 token 组是本次诊断关心的完整总体，因此使用
+                # unbiased=False（ddof=0），单 token 分组也能得到定义良好的 0 方差。
+                "similarity_variance": float(
+                    group_scores.var(unbiased=False).item()
+                ),
+                "entropy": self._histogram_entropy(entropy_counts),
+            }
+
         return {
             "threshold": threshold,
-            "mean_similarity": float(scores.mean().item()),
-            # 每张候选图的视觉 token 是本次诊断关心的完整总体，因此使用
-            # unbiased=False（ddof=0），单 token 候选也能得到定义良好的 0 方差。
-            "similarity_variance": float(scores.var(unbiased=False).item()),
-            "entropy": self._histogram_entropy(counts),
+            "token_groups": token_group_metrics,
         }
+
+    @staticmethod
+    def _accumulate_candidate_metric_values(
+        sums: Dict[str, float],
+        values: Mapping[str, Any],
+    ) -> None:
+        """Add one candidate's all/pruned/kept scalar metrics to ``sums``."""
+        sums["pruning_threshold_similarity"] += float(values["threshold"])
+        for token_group in TOKEN_SCORE_GROUPS:
+            metrics = values["token_groups"][token_group]
+            entropy = metrics["entropy"]
+            sums[f"{token_group}_token_similarity"] += metrics[
+                "mean_similarity"
+            ]
+            sums[f"{token_group}_token_similarity_variance"] += metrics[
+                "similarity_variance"
+            ]
+            sums[f"{token_group}_entropy_shannon_bits"] += entropy[
+                "shannon_bits"
+            ]
+            sums[f"{token_group}_entropy_normalized"] += entropy["normalized"]
+            sums[f"{token_group}_entropy_effective_bins"] += entropy[
+                "effective_bins"
+            ]
+
+    @staticmethod
+    def _mean_candidate_token_metrics(
+        sums: Mapping[str, float],
+        candidate_count: int,
+    ) -> Dict[str, Any]:
+        """Build parallel output fields for all/pruned/kept token groups."""
+        output: Dict[str, Any] = {}
+        for token_group in TOKEN_SCORE_GROUPS:
+            if candidate_count == 0:
+                mean_similarity = None
+                mean_variance = None
+                mean_entropy = {
+                    "shannon_bits": None,
+                    "normalized": None,
+                    "effective_bins": None,
+                }
+            else:
+                mean_similarity = (
+                    sums[f"{token_group}_token_similarity"] / candidate_count
+                )
+                mean_variance = (
+                    sums[f"{token_group}_token_similarity_variance"]
+                    / candidate_count
+                )
+                mean_entropy = {
+                    "shannon_bits": (
+                        sums[f"{token_group}_entropy_shannon_bits"]
+                        / candidate_count
+                    ),
+                    "normalized": (
+                        sums[f"{token_group}_entropy_normalized"]
+                        / candidate_count
+                    ),
+                    "effective_bins": (
+                        sums[f"{token_group}_entropy_effective_bins"]
+                        / candidate_count
+                    ),
+                }
+            output.update({
+                f"mean_{token_group}_token_similarity": mean_similarity,
+                f"mean_{token_group}_token_similarity_variance": mean_variance,
+                f"mean_{token_group}_token_similarity_entropy": mean_entropy,
+            })
+        return output
 
 
     def _add_top1_outcome_query(
@@ -495,6 +677,7 @@ class TokenSimilarityAnalysisCollector:
         gt_positions: Sequence[int],
         negative_positions: Sequence[int],
         stats_by_position: Mapping[int, Mapping[str, Any]],
+        entropy_similarity_range: tuple[float, float],
     ) -> None:
         """Apply the requested candidate rule for one reranked query."""
         top1_position = int(ranked_indices[0])
@@ -539,6 +722,7 @@ class TokenSimilarityAnalysisCollector:
                 stats_by_position[position]
                 for position in selected_incorrect_positions
             ],
+            entropy_similarity_range=entropy_similarity_range,
         )
 
     def _add_top1_outcome_candidate_sets(
@@ -546,6 +730,7 @@ class TokenSimilarityAnalysisCollector:
         outcome_group: str,
         correct_stats: Sequence[Mapping[str, Any]],
         incorrect_stats: Sequence[Mapping[str, Any]],
+        entropy_similarity_range: tuple[float, float],
     ) -> None:
         """Accumulate scalar metrics and one query-balanced histogram per class."""
         if outcome_group not in TOP1_OUTCOME_GROUPS:
@@ -563,7 +748,10 @@ class TokenSimilarityAnalysisCollector:
         # a malformed candidate can therefore never leave a half-updated query.
         values_by_class = {
             candidate_class: [
-                self._candidate_comparison_values(stats)
+                self._candidate_comparison_values(
+                    stats,
+                    entropy_similarity_range,
+                )
                 for stats in candidate_stats
             ]
             for candidate_class, candidate_stats in stats_by_class.items()
@@ -588,15 +776,7 @@ class TokenSimilarityAnalysisCollector:
         for candidate_class, candidate_values in values_by_class.items():
             sums = self._outcome_metric_sums[outcome_group][candidate_class]
             for values in candidate_values:
-                entropy = values["entropy"]
-                sums["pruning_threshold_similarity"] += values["threshold"]
-                sums["all_token_similarity"] += values["mean_similarity"]
-                sums["all_token_similarity_variance"] += values[
-                    "similarity_variance"
-                ]
-                sums["entropy_shannon_bits"] += entropy["shannon_bits"]
-                sums["entropy_normalized"] += entropy["normalized"]
-                sums["entropy_effective_bins"] += entropy["effective_bins"]
+                self._accumulate_candidate_metric_values(sums, values)
             self._outcome_candidate_counts[outcome_group][candidate_class] += len(
                 candidate_values
             )
@@ -605,9 +785,14 @@ class TokenSimilarityAnalysisCollector:
             self._outcome_histogram_sums[outcome_group][
                 candidate_class
             ] += query_histogram
-            self._outcome_histogram_squared_sums[outcome_group][
+            histogram_min = self._outcome_histogram_mins[outcome_group][
                 candidate_class
-            ] += np.square(query_histogram)
+            ]
+            histogram_max = self._outcome_histogram_maxs[outcome_group][
+                candidate_class
+            ]
+            np.minimum(histogram_min, query_histogram, out=histogram_min)
+            np.maximum(histogram_max, query_histogram, out=histogram_max)
 
         self.outcome_group_query_counts[outcome_group] += 1
 
@@ -626,17 +811,20 @@ class TokenSimilarityAnalysisCollector:
         self,
         highest_incorrect_stats: Mapping[str, Any],
         highest_correct_stats: Mapping[str, Any],
+        entropy_similarity_range: tuple[float, float],
     ) -> None:
         """让一个 query 的最高排名错误候选和最高排名 GT 各贡献一次。"""
         self._add_query_candidate_set_comparison(
             incorrect_stats=[highest_incorrect_stats],
             ground_truth_stats=[highest_correct_stats],
+            entropy_similarity_range=entropy_similarity_range,
         )
 
     def _add_query_candidate_set_comparison(
         self,
         incorrect_stats: Sequence[Mapping[str, Any]],
         ground_truth_stats: Sequence[Mapping[str, Any]],
+        entropy_similarity_range: tuple[float, float],
     ) -> None:
         """累计一个 query 中被选中的 GT 与高排名错误候选。"""
         if not incorrect_stats or not ground_truth_stats:
@@ -649,26 +837,25 @@ class TokenSimilarityAnalysisCollector:
         # 当前 query 不会只写入一半，从而保证候选计数和浮点累加和始终同步。
         values_by_role = {
             "ground_truth_candidates": [
-                self._candidate_comparison_values(stats)
+                self._candidate_comparison_values(
+                    stats,
+                    entropy_similarity_range,
+                )
                 for stats in ground_truth_stats
             ],
             "top_ranked_incorrect_candidates": [
-                self._candidate_comparison_values(stats) for stats in incorrect_stats
+                self._candidate_comparison_values(
+                    stats,
+                    entropy_similarity_range,
+                )
+                for stats in incorrect_stats
             ],
         }
 
         for role, candidate_values in values_by_role.items():
             sums = self._comparison_sums[role]
             for values in candidate_values:
-                entropy = values["entropy"]
-                sums["pruning_threshold_similarity"] += values["threshold"]
-                sums["all_token_similarity"] += values["mean_similarity"]
-                sums["all_token_similarity_variance"] += values[
-                    "similarity_variance"
-                ]
-                sums["entropy_shannon_bits"] += entropy["shannon_bits"]
-                sums["entropy_normalized"] += entropy["normalized"]
-                sums["entropy_effective_bins"] += entropy["effective_bins"]
+                self._accumulate_candidate_metric_values(sums, values)
             self._comparison_candidate_counts[role] += len(candidate_values)
         self.comparison_eligible_queries += 1
 
@@ -684,35 +871,15 @@ class TokenSimilarityAnalysisCollector:
             candidate_count = self._comparison_candidate_counts[role]
             if candidate_count == 0:
                 mean_threshold = None
-                mean_similarity = None
-                mean_variance = None
-                mean_entropy = {
-                    "shannon_bits": None,
-                    "normalized": None,
-                    "effective_bins": None,
-                }
             else:
                 mean_threshold = (
                     sums["pruning_threshold_similarity"] / candidate_count
                 )
-                mean_similarity = sums["all_token_similarity"] / candidate_count
-                mean_variance = (
-                    sums["all_token_similarity_variance"] / candidate_count
-                )
-                mean_entropy = {
-                    "shannon_bits": sums["entropy_shannon_bits"] / candidate_count,
-                    "normalized": sums["entropy_normalized"] / candidate_count,
-                    "effective_bins": (
-                        sums["entropy_effective_bins"] / candidate_count
-                    ),
-                }
             return {
                 "num_queries": query_count,
                 "num_candidates": candidate_count,
                 "mean_pruning_threshold_similarity": mean_threshold,
-                "mean_all_token_similarity": mean_similarity,
-                "mean_all_token_similarity_variance": mean_variance,
-                "mean_all_token_similarity_entropy": mean_entropy,
+                **self._mean_candidate_token_metrics(sums, candidate_count),
             }
 
         return {
@@ -721,16 +888,28 @@ class TokenSimilarityAnalysisCollector:
             "eligible_paired_queries": query_count,
             "skipped_queries": dict(sorted(self.comparison_skipped_counts.items())),
             "candidate_weighting": (
-                "Each selected candidate contributes equally. A candidate's mean "
-                "similarity is calculated across all of its visual tokens before "
+                "Each selected candidate contributes equally. Similarity mean, "
+                "population variance, and histogram entropy are calculated "
+                "separately for each token group within a candidate before "
                 "candidate-level averaging."
             ),
+            "token_group_definitions": {
+                "all": "All visual tokens before pruning.",
+                "pruned": (
+                    "Visual tokens where the actual kept_mask is false at the "
+                    "configured keep ratio."
+                ),
+                "kept": (
+                    "Visual tokens where the actual kept_mask is true at the "
+                    "configured keep ratio."
+                ),
+            },
             "variance_basis": {
-                "score_group": "all visual tokens before pruning",
+                "score_groups": list(TOKEN_SCORE_GROUPS),
                 "ddof": 0,
                 "definition": (
                     "Population variance is calculated separately within every "
-                    "selected candidate."
+                    "selected candidate and token group using raw similarities."
                 ),
                 "aggregation": (
                     "Candidate variances are averaged with equal candidate weight "
@@ -755,15 +934,18 @@ class TokenSimilarityAnalysisCollector:
                 },
             },
             "entropy_basis": {
-                "score_group": "all visual tokens before pruning",
-                "display_range": [
-                    float(self.bin_edges[0]),
-                    float(self.bin_edges[-1]),
-                ],
+                "score_groups": list(TOKEN_SCORE_GROUPS),
                 "num_bins": self.num_bins,
-                "out_of_range_rule": (
-                    "Values are clipped into the first or last bin before entropy "
-                    "is calculated."
+                "range_scope": "per_query",
+                "range_definition": (
+                    "For each query, bin edges span the raw minimum and maximum "
+                    "similarity across all tokens from all first-stage Top-K "
+                    "candidates. The same edges are used for every selected "
+                    "candidate and token group in that query."
+                ),
+                "degenerate_range_rule": (
+                    "If a query minimum equals its maximum, all tokens are placed "
+                    "in one bin and entropy is zero."
                 ),
                 "aggregation": (
                     "Entropy is calculated separately for every selected candidate, "
@@ -786,38 +968,30 @@ class TokenSimilarityAnalysisCollector:
         outcome_group: str,
         candidate_class: str,
     ) -> Dict[str, Any]:
-        """Return the query-balanced mean density and its per-bin 95% CI."""
+        """Return the mean density and per-bin range across query samples."""
         query_count = self.outcome_group_query_counts[outcome_group]
         if query_count == 0:
             return {
                 "num_query_histograms": 0,
                 "mean_density": None,
-                "ci95_lower": None,
-                "ci95_upper": None,
+                "min_density": None,
+                "max_density": None,
             }
 
         histogram_sum = self._outcome_histogram_sums[outcome_group][
             candidate_class
         ]
-        mean_density = histogram_sum / query_count
-        if query_count == 1:
-            ci = np.zeros_like(mean_density)
-        else:
-            squared_sum = self._outcome_histogram_squared_sums[outcome_group][
-                candidate_class
-            ]
-            centered_sum_squares = np.maximum(
-                squared_sum - np.square(histogram_sum) / query_count,
-                0.0,
-            )
-            sample_variance = centered_sum_squares / (query_count - 1)
-            ci = 1.96 * np.sqrt(sample_variance / query_count)
+        mean_density = np.asarray(histogram_sum / query_count, dtype=np.float64)
 
         return {
             "num_query_histograms": query_count,
             "mean_density": mean_density.tolist(),
-            "ci95_lower": np.maximum(mean_density - ci, 0.0).tolist(),
-            "ci95_upper": (mean_density + ci).tolist(),
+            "min_density": self._outcome_histogram_mins[outcome_group][
+                candidate_class
+            ].tolist(),
+            "max_density": self._outcome_histogram_maxs[outcome_group][
+                candidate_class
+            ].tolist(),
         }
 
     def _top1_outcome_similarity_summary(
@@ -854,32 +1028,10 @@ class TokenSimilarityAnalysisCollector:
             sums = self._outcome_metric_sums[outcome_group][candidate_class]
             if candidate_count == 0:
                 mean_threshold = None
-                mean_similarity = None
-                mean_variance = None
-                mean_entropy = {
-                    "shannon_bits": None,
-                    "normalized": None,
-                    "effective_bins": None,
-                }
             else:
                 mean_threshold = (
                     sums["pruning_threshold_similarity"] / candidate_count
                 )
-                mean_similarity = sums["all_token_similarity"] / candidate_count
-                mean_variance = (
-                    sums["all_token_similarity_variance"] / candidate_count
-                )
-                mean_entropy = {
-                    "shannon_bits": (
-                        sums["entropy_shannon_bits"] / candidate_count
-                    ),
-                    "normalized": (
-                        sums["entropy_normalized"] / candidate_count
-                    ),
-                    "effective_bins": (
-                        sums["entropy_effective_bins"] / candidate_count
-                    ),
-                }
             return {
                 "num_queries": query_count,
                 "num_candidates": candidate_count,
@@ -887,9 +1039,7 @@ class TokenSimilarityAnalysisCollector:
                     candidate_count / query_count if query_count else None
                 ),
                 "mean_pruning_threshold_similarity": mean_threshold,
-                "mean_all_token_similarity": mean_similarity,
-                "mean_all_token_similarity_variance": mean_variance,
-                "mean_all_token_similarity_entropy": mean_entropy,
+                **self._mean_candidate_token_metrics(sums, candidate_count),
                 "token_similarity_distribution": (
                     self._top1_outcome_distribution_summary(
                         outcome_group,
@@ -907,27 +1057,52 @@ class TokenSimilarityAnalysisCollector:
             ),
             "bin_edges": self.bin_edges.tolist(),
             "candidate_metric_weighting": (
-                "Each selected candidate contributes equally to scalar means."
+                "Each selected candidate contributes equally. Similarity mean, "
+                "population variance, and histogram entropy are calculated "
+                "separately for all, pruned, and kept tokens within a candidate."
             ),
+            "token_group_definitions": {
+                "all": "All visual tokens before pruning.",
+                "pruned": (
+                    "Visual tokens where the actual kept_mask is false at the "
+                    "configured keep ratio."
+                ),
+                "kept": (
+                    "Visual tokens where the actual kept_mask is true at the "
+                    "configured keep ratio."
+                ),
+            },
             "distribution_weighting": (
                 "Each candidate is converted to a normalized density. Candidates "
                 "of the same class are averaged within a query, then queries are "
                 "averaged equally."
             ),
+            "distribution_interval": (
+                "For each histogram bin, min_density and max_density are the "
+                "minimum and maximum query-level densities across eligible queries."
+            ),
             "variance_basis": {
-                "score_group": "all visual tokens before pruning",
+                "score_groups": list(TOKEN_SCORE_GROUPS),
                 "ddof": 0,
+                "definition": (
+                    "Population variance is calculated within each candidate and "
+                    "token group using raw similarities."
+                ),
                 "aggregation": "Candidate population variances are averaged equally.",
             },
             "entropy_basis": {
-                "score_group": "all visual tokens before pruning",
+                "score_groups": list(TOKEN_SCORE_GROUPS),
                 "num_bins": self.num_bins,
-                "display_range": [
-                    float(self.bin_edges[0]),
-                    float(self.bin_edges[-1]),
-                ],
-                "out_of_range_rule": (
-                    "Values are clipped into the first or last bin."
+                "range_scope": "per_query",
+                "range_definition": (
+                    "For each query, bin edges span the raw minimum and maximum "
+                    "similarity across all tokens from all first-stage Top-K "
+                    "candidates. The same edges are used for every selected "
+                    "candidate and token group in that query."
+                ),
+                "degenerate_range_rule": (
+                    "If a query minimum equals its maximum, all tokens are placed "
+                    "in one bin and entropy is zero."
                 ),
             },
             "groups": {
@@ -1191,6 +1366,7 @@ class TokenSimilarityAnalysisCollector:
             "ground_truth_page_ids": example["ground_truth_page_ids"],
             "recall_at_1": example["recall_at_1"],
             "recall1_correct": example["recall1_correct"],
+            "entropy_similarity_range": example["entropy_similarity_range"],
             "candidates": [
                 self._candidate_summary(candidate)
                 for candidate in example["candidates"]
@@ -1200,12 +1376,17 @@ class TokenSimilarityAnalysisCollector:
     def _candidate_histogram_export(
         self,
         candidate: Mapping[str, Any],
+        entropy_similarity_range: tuple[float, float],
     ) -> Dict[str, Any]:
         """导出一个候选子图中三条直方图的逐 bin 数量和密度。"""
         exported = self._candidate_summary(candidate)
         distributions = {}
         for group_name, group_scores in self._candidate_score_groups(candidate).items():
             counts, density = self._histogram_counts_and_density(group_scores)
+            entropy_counts = self._entropy_histogram_counts(
+                group_scores,
+                entropy_similarity_range,
+            )
             raw_values = group_scores.numpy()
             distributions[group_name] = {
                 "num_tokens": int(group_scores.numel()),
@@ -1218,10 +1399,11 @@ class TokenSimilarityAnalysisCollector:
                 ),
                 "counts": counts.astype(np.int64).tolist(),
                 "density": density.tolist(),
-                # all、pruned、kept 都按各自包含的 token 计算总体方差；
-                # 其中 all 与 candidate.similarity.variance 是同一个统计量。
+                # all、pruned、kept 都按各自包含的 token 计算均值和总体方差；
+                # 其中 all 与 candidate.similarity 中的同名统计量一致。
+                "mean": float(np.mean(raw_values)),
                 "variance": float(np.var(raw_values, ddof=0)),
-                "entropy": self._histogram_entropy(counts),
+                "entropy": self._histogram_entropy(entropy_counts),
             }
         exported["distributions"] = distributions
         return exported
@@ -1231,6 +1413,11 @@ class TokenSimilarityAnalysisCollector:
         example: Mapping[str, Any],
     ) -> Dict[str, Any]:
         """导出图片中一整行 query 的候选身份和直方图数据。"""
+        entropy_range_values = example["entropy_similarity_range"]
+        entropy_similarity_range = (
+            float(entropy_range_values[0]),
+            float(entropy_range_values[1]),
+        )
         return {
             "qid": example["qid"],
             "doc_name": example["doc_name"],
@@ -1240,8 +1427,12 @@ class TokenSimilarityAnalysisCollector:
             "ground_truth_page_ids": example["ground_truth_page_ids"],
             "recall_at_1": example["recall_at_1"],
             "recall1_correct": example["recall1_correct"],
+            "entropy_similarity_range": example["entropy_similarity_range"],
             "candidates": [
-                self._candidate_histogram_export(candidate)
+                self._candidate_histogram_export(
+                    candidate,
+                    entropy_similarity_range,
+                )
                 for candidate in example["candidates"]
             ],
         }
@@ -1283,6 +1474,11 @@ class TokenSimilarityAnalysisCollector:
                 ),
                 "effective_bins": (
                     "2 ** shannon_bits: the equivalent number of equally occupied bins."
+                ),
+                "bin_range": (
+                    "Each query uses its raw minimum and maximum similarity across "
+                    "all tokens from all first-stage Top-K candidates. The same "
+                    "query-specific range is used for all candidate and token groups."
                 ),
             },
             "groups": {
@@ -1356,8 +1552,8 @@ class TokenSimilarityAnalysisCollector:
                 )
                 axis.fill_between(
                     centers,
-                    distribution["ci95_lower"],
-                    distribution["ci95_upper"],
+                    distribution["min_density"],
+                    distribution["max_density"],
                     color=style["color"],
                     alpha=0.14,
                 )
@@ -1400,7 +1596,7 @@ class TokenSimilarityAnalysisCollector:
         axes[0].set_ylabel("Query-balanced density")
         fig.suptitle(
             f"Token similarity by reranking Top1 outcome (keep {keep_ratio:.0%})\n"
-            "Shaded region: query-level normal-approximation 95% CI",
+            "Shaded region: per-bin min-max range across query samples",
             fontsize=13,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.90))
@@ -1464,16 +1660,15 @@ class TokenSimilarityAnalysisCollector:
                     markeredgewidth=1.2,
                     label=label,
                 )
-                if len(values) > 1:
-                    # 阴影是在各 query 直方图之间估计的均值 95% 置信区间。
-                    ci = 1.96 * values.std(axis=0, ddof=1) / math.sqrt(len(values))
-                    ax.fill_between(
-                        centers,
-                        np.maximum(mean - ci, 0.0),
-                        mean + ci,
-                        color=color,
-                        alpha=0.16,
-                    )
+                # 每个 bin 独立取所有 query 样例的最小值和最大值；只有一个样例时，
+                # 上下界都等于该样例曲线，因此阴影自然退化为零宽度。
+                ax.fill_between(
+                    centers,
+                    values.min(axis=0),
+                    values.max(axis=0),
+                    color=color,
+                    alpha=0.16,
+                )
                 plotted = True
 
             title_label = "Recall@1 correct" if group == "correct" else "Recall@1 incorrect (GT in Top-K)"
@@ -1489,7 +1684,7 @@ class TokenSimilarityAnalysisCollector:
         axes[0].set_ylabel("Query-balanced density")
         fig.suptitle(
             f"Overall QI-Early token similarity distributions (keep {keep_ratio:.0%})\n"
-            "Shaded region: query-level normal-approximation 95% CI",
+            "Shaded region: per-bin min-max range across query samples",
             fontsize=13,
         )
         fig.tight_layout(rect=(0, 0, 1, 0.90))

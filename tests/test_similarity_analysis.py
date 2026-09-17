@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 from utils.similarity_analysis import TokenSimilarityAnalysisCollector
@@ -158,6 +159,22 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             incorrect["mean_all_token_similarity"],
             0.013333333333333334,
         )
+        self.assertAlmostEqual(
+            ground_truth["mean_pruned_token_similarity"],
+            -0.12,
+        )
+        self.assertAlmostEqual(
+            ground_truth["mean_kept_token_similarity"],
+            0.18,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_pruned_token_similarity"],
+            -0.13666666666666666,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_kept_token_similarity"],
+            0.16333333333333333,
+        )
         # 所有候选只发生整体平移，token 离均差不变，因此两类候选的平均
         # 总体方差都应保持为 0.025。
         self.assertAlmostEqual(
@@ -168,7 +185,28 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             incorrect["mean_all_token_similarity_variance"],
             0.025,
         )
+        for metrics in (ground_truth, incorrect):
+            self.assertAlmostEqual(
+                metrics["mean_pruned_token_similarity_variance"],
+                0.0025,
+            )
+            self.assertAlmostEqual(
+                metrics["mean_kept_token_similarity_variance"],
+                0.0025,
+            )
+            self.assertAlmostEqual(
+                metrics["mean_pruned_token_similarity_entropy"]["shannon_bits"],
+                1.0,
+            )
+            self.assertAlmostEqual(
+                metrics["mean_kept_token_similarity_entropy"]["shannon_bits"],
+                1.0,
+            )
         self.assertEqual(summary["variance_basis"]["ddof"], 0)
+        self.assertEqual(
+            summary["variance_basis"]["score_groups"],
+            ["all", "pruned", "kept"],
+        )
         self.assertEqual(
             summary["selection_rule"]["ground_truth_candidates"][
                 "maximum_per_query"
@@ -240,17 +278,143 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             incorrect["mean_all_token_similarity_entropy"]["shannon_bits"],
-            1.5,
+            2.0,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_pruned_token_similarity"],
+            -0.1366666667,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_kept_token_similarity"],
+            0.1633333333,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_pruned_token_similarity_variance"],
+            0.0025,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_kept_token_similarity_variance"],
+            0.0025,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_pruned_token_similarity_entropy"]["shannon_bits"],
+            1.0,
+        )
+        self.assertAlmostEqual(
+            incorrect["mean_kept_token_similarity_entropy"]["shannon_bits"],
+            1.0,
         )
 
         distribution = incorrect["token_similarity_distribution"]
         self.assertEqual(distribution["num_query_histograms"], 1)
         self.assertEqual(len(distribution["mean_density"]), 80)
+        self.assertEqual(distribution["min_density"], distribution["mean_density"])
+        self.assertEqual(distribution["max_density"], distribution["mean_density"])
+        self.assertNotIn("ci95_lower", distribution)
+        self.assertNotIn("ci95_upper", distribution)
         bin_width = summary["bin_edges"][1] - summary["bin_edges"][0]
         self.assertAlmostEqual(
             sum(distribution["mean_density"]) * bin_width,
             1.0,
             places=5,
+        )
+
+    def test_top1_outcome_distribution_reports_query_min_max_envelope(self):
+        collector = TokenSimilarityAnalysisCollector(
+            num_examples=5,
+            seed=7,
+            num_bins=8,
+        )
+        result = self._result(
+            ranked_indices=[2, 0, 1, 3, 4],
+            ground_truth_page_ids=[3],
+        )
+        first_stats = self._candidate_stats()
+        second_stats = self._candidate_stats()
+        for item in second_stats:
+            item["scores"] = item["scores"] + 0.04
+            item["threshold"] += 0.04
+
+        first_histogram = collector._normalized_histogram(first_stats[2]["scores"])
+        second_histogram = collector._normalized_histogram(second_stats[2]["scores"])
+        collector.add_query(result, first_stats)
+        collector.add_query(result, second_stats)
+
+        summary = collector._top1_outcome_similarity_summary(keep_ratio=0.5)
+        distribution = summary["groups"]["top1_correct"][
+            "correct_candidates"
+        ]["token_similarity_distribution"]
+        self.assertEqual(distribution["num_query_histograms"], 2)
+        np.testing.assert_allclose(
+            distribution["mean_density"],
+            (first_histogram + second_histogram) / 2,
+        )
+        np.testing.assert_allclose(
+            distribution["min_density"],
+            np.minimum(first_histogram, second_histogram),
+        )
+        np.testing.assert_allclose(
+            distribution["max_density"],
+            np.maximum(first_histogram, second_histogram),
+        )
+
+    def test_entropy_uses_full_query_min_max_for_all_candidate_groups(self):
+        collector = TokenSimilarityAnalysisCollector(
+            num_examples=5,
+            seed=7,
+            num_bins=2,
+        )
+        result = self._result(
+            ranked_indices=[2, 0, 1, 3, 4],
+            ground_truth_page_ids=[3],
+        )
+        candidate_stats = self._candidate_stats()
+        for item in candidate_stats:
+            item["scores"] = torch.tensor([0.0, 1.0, 2.0, 3.0])
+            item["threshold"] = 2.0
+        # candidate_pos=4 不会进入 Top1 outcome 或默认全局汇总的候选集合，
+        # 但它仍属于这个 query 的一阶段 Top-K，因此必须把熵范围扩到 100。
+        candidate_stats[4]["scores"] = torch.tensor([0.0, 1.0, 2.0, 100.0])
+        collector.add_query(result, candidate_stats)
+
+        top1_summary = collector._top1_outcome_similarity_summary(keep_ratio=0.5)
+        top1_correct = top1_summary["groups"]["top1_correct"][
+            "correct_candidates"
+        ]
+        self.assertEqual(top1_summary["entropy_basis"]["range_scope"], "per_query")
+        self.assertAlmostEqual(
+            top1_correct["mean_all_token_similarity_entropy"]["shannon_bits"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            top1_correct["mean_pruned_token_similarity_entropy"]["shannon_bits"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            top1_correct["mean_kept_token_similarity_entropy"]["shannon_bits"],
+            0.0,
+        )
+
+        global_summary = collector._all_query_candidate_comparison_summary(
+            keep_ratio=0.5
+        )
+        global_correct = global_summary["metrics"]["ground_truth_candidates"]
+        self.assertAlmostEqual(
+            global_correct["mean_all_token_similarity_entropy"]["shannon_bits"],
+            0.0,
+        )
+
+        example = collector._histogram_export(keep_ratio=0.5)["groups"]["correct"][0]
+        self.assertEqual(example["entropy_similarity_range"], [0.0, 100.0])
+
+        degenerate_counts = collector._entropy_histogram_counts(
+            torch.ones(4),
+            (1.0, 1.0),
+        )
+        self.assertEqual(degenerate_counts.tolist(), [4, 0])
+        self.assertAlmostEqual(
+            collector._histogram_entropy(degenerate_counts)["shannon_bits"],
+            0.0,
         )
 
     def test_save_writes_per_bin_counts_for_each_candidate_distribution(self):
@@ -335,24 +499,39 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             [pruned + kept for pruned, kept in zip(pruned_counts, kept_counts)],
         )
 
-        # 第一个被选候选的四个分数落入三个 bin，概率为 [0.5, 0.25, 0.25]，
-        # 因此 all 分布的 Shannon 熵应为 1.5 bits。
+        self.assertAlmostEqual(
+            exported["groups"]["correct"][0]["entropy_similarity_range"][0],
+            -0.2,
+        )
+        self.assertAlmostEqual(
+            exported["groups"]["correct"][0]["entropy_similarity_range"][1],
+            0.24,
+        )
+
+        # 熵使用 query 全部候选的真实 [-0.2, 0.24] 区间。当前候选的四个值
+        # 分别落入不同 bin，因此 all 分布的 Shannon 熵为 2 bits。
         all_entropy = distributions["all"]["entropy"]
-        self.assertAlmostEqual(all_entropy["shannon_bits"], 1.5)
+        self.assertAlmostEqual(all_entropy["shannon_bits"], 2.0)
         self.assertAlmostEqual(
             all_entropy["normalized"],
-            1.5 / math.log2(80),
+            2.0 / math.log2(80),
         )
-        self.assertAlmostEqual(all_entropy["effective_bins"], 2.0 ** 1.5)
+        self.assertAlmostEqual(all_entropy["effective_bins"], 4.0)
         self.assertAlmostEqual(distributions["all"]["variance"], 0.025)
         self.assertAlmostEqual(distributions["pruned"]["variance"], 0.0025)
         self.assertAlmostEqual(distributions["kept"]["variance"], 0.0025)
+        self.assertAlmostEqual(distributions["all"]["mean"], 0.02)
+        self.assertAlmostEqual(distributions["pruned"]["mean"], -0.13)
+        self.assertAlmostEqual(distributions["kept"]["mean"], 0.17)
 
-        # 两个被剪掉的负相似度都会夹到第一个 bin，因此熵为 0。
+        # 两个被剪掉的负相似度在 query 实际区间内落入不同 bin，因此熵为 1。
         pruned_entropy = distributions["pruned"]["entropy"]
-        self.assertAlmostEqual(pruned_entropy["shannon_bits"], 0.0)
-        self.assertAlmostEqual(pruned_entropy["normalized"], 0.0)
-        self.assertAlmostEqual(pruned_entropy["effective_bins"], 1.0)
+        self.assertAlmostEqual(pruned_entropy["shannon_bits"], 1.0)
+        self.assertAlmostEqual(
+            pruned_entropy["normalized"],
+            1.0 / math.log2(80),
+        )
+        self.assertAlmostEqual(pruned_entropy["effective_bins"], 2.0)
 
         self.assertEqual(comparison["total_queries_seen"], 1)
         self.assertEqual(comparison["eligible_paired_queries"], 1)
@@ -370,11 +549,11 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
         )
         self.assertAlmostEqual(
             incorrect_metrics["mean_all_token_similarity_entropy"]["shannon_bits"],
-            1.5,
+            2.0,
         )
         self.assertAlmostEqual(
             correct_metrics["mean_all_token_similarity_entropy"]["shannon_bits"],
-            1.5,
+            2.0,
         )
         self.assertAlmostEqual(
             incorrect_metrics["mean_all_token_similarity_variance"],
@@ -384,14 +563,42 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             correct_metrics["mean_all_token_similarity_variance"],
             0.025,
         )
+        for metrics in (incorrect_metrics, correct_metrics):
+            self.assertAlmostEqual(
+                metrics["mean_pruned_token_similarity_variance"],
+                0.0025,
+            )
+            self.assertAlmostEqual(
+                metrics["mean_kept_token_similarity_variance"],
+                0.0025,
+            )
+            self.assertAlmostEqual(
+                metrics["mean_pruned_token_similarity_entropy"]["shannon_bits"],
+                1.0,
+            )
+            self.assertAlmostEqual(
+                metrics["mean_kept_token_similarity_entropy"]["shannon_bits"],
+                1.0,
+            )
+
+        top1_metrics = outcome["groups"]["top1_correct"]["correct_candidates"]
+        self.assertAlmostEqual(
+            top1_metrics["mean_pruned_token_similarity"],
+            -0.13,
+        )
+        self.assertAlmostEqual(
+            top1_metrics["mean_kept_token_similarity"],
+            0.17,
+        )
 
     def test_overall_incorrect_curves_use_distinct_overlap_safe_styles(self):
         collector = TokenSimilarityAnalysisCollector(num_examples=1, seed=7)
         one_density_curve = torch.ones(collector.num_bins).numpy()
-        collector.eligible_counts["incorrect"] = 1
+        three_density_curve = 3 * one_density_curve
+        collector.eligible_counts["incorrect"] = 2
         for role in ("top1_incorrect", "other_negatives", "ground_truth"):
-            collector._group_histograms["incorrect"][role].append(
-                one_density_curve
+            collector._group_histograms["incorrect"][role].extend(
+                [one_density_curve, three_density_curve]
             )
 
         # 使用模拟坐标轴捕获 plot 参数，验证完全重合的数据仍会获得不同线型、
@@ -422,6 +629,11 @@ class TokenSimilarityAnalysisCollectorTest(unittest.TestCase):
             [call.kwargs["markevery"] for call in plot_calls],
             [(0, 10), (3, 10), (6, 10)],
         )
+        fill_calls = incorrect_ax.fill_between.call_args_list
+        self.assertEqual(len(fill_calls), 3)
+        for fill_call in fill_calls:
+            np.testing.assert_array_equal(fill_call.args[1], one_density_curve)
+            np.testing.assert_array_equal(fill_call.args[2], three_density_curve)
 
     def test_incorrect_query_without_gt_in_topk_is_skipped(self):
         # GT local_page_id=8 不在候选 [1, 2, 3, 4, 5] 中，无法绘制正确选项。
